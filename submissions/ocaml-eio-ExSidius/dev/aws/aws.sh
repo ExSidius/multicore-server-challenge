@@ -7,13 +7,14 @@
 #   dev/aws/aws.sh test                # sync, build, conformance on the full seed
 #   dev/aws/aws.sh search <label> [start-users]   # sync, then a full search with telemetry, detached on the load box
 #   dev/aws/aws.sh fetch <label>       # copy that run's results and telemetry to dev/results/aws/<label>
+#   dev/aws/aws.sh pgprofile <label> [users]      # fixed load with pg_stat_statements and perf; prints the profile
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SUB="$(cd "$HERE/../.." && pwd)"
 ROOT="$(cd "$SUB/../.." && pwd)"
 NAME="$(basename "$SUB")"
 # The AWS credentials come from the direnv profile of this folder.
-if [ -z "${AWS_CONFIG_FILE:-}" ]; then exec direnv exec "$ROOT" bash "$0" "$@" 2>/dev/null; fi
+if [ -z "${AWS_CONFIG_FILE:-}" ]; then export DIRENV_LOG_FORMAT=""; exec direnv exec "$ROOT" bash "$0" "$@"; fi
 export AWS_PAGER=""
 KEY="$HOME/.ssh/id_ed_personal"
 SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
@@ -91,6 +92,21 @@ case "${1:-}" in
       sudo sh -c '[ -d /root/results/$NAME ] && mv /root/results/$NAME /root/archive/$NAME-\$(date +%s) ; rm -f /root/results/$NAME.out /root/results/$NAME.prepare.log; echo $NAME > /root/batch.txt; echo $LABEL > /root/current-label'
       sudo env TARGET=root@$PRIVATE URLS=$URLS START=$START MAX=250000 setsid nohup bash /root/chain.sh /root/batch.txt > /tmp/chain.out 2>&1 </dev/null & disown"
     echo "search $LABEL started from $START users" ;;
+  pgprofile)
+    LABEL="${2:?usage: aws.sh pgprofile <label> [users]}"; USERS="${3:-40000}"
+    resolve; searching && { echo "a search is running: wait for it"; exit 1; }
+    URLS=$(target_urls); sync_and_build
+    TOOL="/opt/challenge/subs/$NAME/dev/aws/pgprofile-target.sh"
+    on_target "sudo systemctl stop challenge; sudo bash $TOOL setup; sudo /opt/conduit-tools/switch.sh $NAME --no-conformance | tail -1 | cut -c1-100"
+    on_loadgen "sudo mkdir -p /root/pgprofile/$LABEL; sudo env CONDUIT_JWT_SECRET=multicore-server-challenge sh -c 'ulimit -n 1048576; setsid nohup conduit-loadgen run -target $URLS -users $USERS -box-index 0 -id-offset 0 -ramp 60s -measure 150s -tail 15s -secret multicore-server-challenge -run-id prof\$(date +%s) -q -out /root/pgprofile/$LABEL/box0.json > /root/pgprofile/$LABEL/run.log 2>&1 </dev/null &'"
+    on_target "sudo bash $TOOL capture /root/pgprofile/$LABEL 90"
+    sleep 50
+    on_loadgen "sudo conduit-loadgen merge -o /root/pgprofile/$LABEL/merged.json /root/pgprofile/$LABEL/box0.json | tail -6 | cut -c1-120 || true"
+    on_target "sudo bash $TOOL teardown"
+    DEST="$SUB/dev/results/aws/pgprofile-$LABEL"; mkdir -p "$DEST"
+    rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$TARGET:/root/pgprofile/$LABEL/" "$DEST/"
+    rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$LOADGEN:/root/pgprofile/$LABEL/merged.json" "$DEST/"
+    echo "$DEST" ;;
   fetch)
     LABEL="${2:?usage: aws.sh fetch <label>}"; resolve
     DEST="$SUB/dev/results/aws/$LABEL"; mkdir -p "$DEST"

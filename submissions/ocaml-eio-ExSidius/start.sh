@@ -3,5 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ulimit -n "$(ulimit -Hn)"
+# Postgres is on the same box, over loopback: TLS would only burn CPU on both ends.
+export PGSSLMODE="${PGSSLMODE:-disable}"
 export OCAMLRUNPARAM="${OCAMLRUNPARAM:-s=1M}"
 exec ./_build/default/src/main.exe
