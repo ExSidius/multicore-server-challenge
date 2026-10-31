@@ -8,6 +8,7 @@
 #   dev/aws/aws.sh search <label> [start-users]   # sync, then a full search with telemetry, detached on the load box
 #   dev/aws/aws.sh fetch <label>       # copy that run's results and telemetry to dev/results/aws/<label>
 #   dev/aws/aws.sh pgprofile <label> [users]      # fixed load with pg_stat_statements and perf; prints the profile
+#   dev/aws/aws.sh hold <label> <users>           # conformance, fresh database, then a 5-minute hold with no profilers
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SUB="$(cd "$HERE/../.." && pwd)"
@@ -107,6 +108,18 @@ case "${1:-}" in
     rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$TARGET:/root/pgprofile/$LABEL/" "$DEST/"
     rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$LOADGEN:/root/pgprofile/$LABEL/merged.json" "$DEST/"
     echo "$DEST" ;;
+  hold)
+    LABEL="${2:?usage: aws.sh hold <label> <users>}"; USERS="${3:?usage: aws.sh hold <label> <users>}"
+    resolve; searching && { echo "a search is running: wait for it"; exit 1; }
+    URLS=$(target_urls); sync_and_build
+    on_target "sudo /opt/conduit-tools/switch.sh $NAME | tail -1 | cut -c1-100"
+    on_target "sudo pkill -f '^bash /opt/conduit-tools/telemetry' || true; sudo setsid nohup /opt/conduit-tools/telemetry.sh /root/telemetry/$LABEL >/dev/null 2>&1 </dev/null & disown"
+    on_loadgen "sudo mkdir -p /root/holds/$LABEL; sudo env CONDUIT_JWT_SECRET=multicore-server-challenge sh -c 'ulimit -n 1048576; conduit-loadgen run -target $URLS -users $USERS -box-index 0 -id-offset 0 -ramp 60s -measure 300s -tail 15s -secret multicore-server-challenge -run-id hold\$(date +%s) -q -out /root/holds/$LABEL/box0.json > /root/holds/$LABEL/run.log 2>&1; conduit-loadgen merge -o /root/holds/$LABEL/merged.json /root/holds/$LABEL/box0.json' | tail -12 | cut -c1-130 || true"
+    on_target "sudo pkill -f '^bash /opt/conduit-tools/telemetry' || true"
+    DEST="$SUB/dev/results/aws/hold-$LABEL"; mkdir -p "$DEST"
+    rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$LOADGEN:/root/holds/$LABEL/merged.json" "$DEST/"
+    rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$TARGET:/root/telemetry/$LABEL/" "$DEST/telemetry/"
+    echo "$DEST" ;;
   fetch)
     LABEL="${2:?usage: aws.sh fetch <label>}"; resolve
     DEST="$SUB/dev/results/aws/$LABEL"; mkdir -p "$DEST"
@@ -114,5 +127,5 @@ case "${1:-}" in
     rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$TARGET:/root/telemetry/$LABEL/" "$DEST/telemetry/"
     on_target "sudo journalctl -u challenge --since '-24h' -o cat --no-pager | grep '^stats ' || true" > "$DEST/telemetry/app_stats.txt"
     echo "$DEST" ;;
-  *) sed -n 2,9p "$0"; exit 2 ;;
+  *) sed -n 2,10p "$0"; exit 2 ;;
 esac

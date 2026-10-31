@@ -126,15 +126,16 @@ let all_tags = s "SELECT ARRAY(SELECT name FROM tags ORDER BY name)"
 (* One statement serves every request in a batch. Pages is one row per distinct page: its ordinal, count and ids, from
    $2 limits, $3 offsets and $4 keys (a tag, a username, a viewer or a slug). An article's own data is read once
    however many pages and viewers want it, and each of the viewers in $1 has their favorites and follows walked once,
-   as a single list's hashed subplans do. Rows, told apart by kind: 1 a page, 2 an article, 3 a favorite, 4 a follow.
-   Tags come unsorted: the app sorts them, which is the same order under the database's C.UTF-8 collation. *)
+   as a single list's hashed subplans do. Rows, told apart by kind: 1 a page, 2 an article, 3 a favorite, 4 a follow,
+   5 a tag's name. An article's tags come as unsorted ids and each name once: the app sorts them, which is the same
+   order under the database's C.UTF-8 collation. *)
 let page_input = "unnest($2::int[], $3::bigint[], $4::text[]) WITH ORDINALITY p(lim, off, key, ord)"
 
 let batch_stmt ?(body = false) pages =
   s ("WITH pages AS MATERIALIZED (" ^ pages
     ^ "),\nids AS MATERIALIZED (SELECT DISTINCT unnest(ids) AS id FROM pages),\narts AS MATERIALIZED (\n  SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, "
     ^ (if body then "a.body" else "NULL::text AS body")
-    ^ ",\n         ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name FROM article_tags at WHERE at.article_id = a.id) AS tag_list,\n         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS n, u.username, u.bio, u.image\n    FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id)\nSELECT 1 AS kind, ord::bigint AS id, total AS x, ids, NULL AS slug, NULL AS title, NULL AS description,\n       NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text[] AS tag_list, NULL::bigint AS n,\n       NULL AS username, NULL AS bio, NULL AS image, NULL AS body\n  FROM pages\nUNION ALL SELECT 2, id, author_id, NULL, slug, title, description, created_at, updated_at, tag_list, n, username, bio, image, body FROM arts\nUNION ALL SELECT 3, f.user_id, f.article_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN favorites f ON f.user_id = v.id WHERE f.article_id IN (SELECT id FROM ids)\nUNION ALL SELECT 4, fo.follower_id, fo.followee_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN follows fo ON fo.follower_id = v.id WHERE fo.followee_id IN (SELECT author_id FROM arts)")
+    ^ ",\n         ARRAY(SELECT at.tag_id::bigint FROM article_tags at WHERE at.article_id = a.id) AS tag_ids,\n         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS n, u.username, u.bio, u.image\n    FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id)\nSELECT 1 AS kind, ord::bigint AS id, total AS x, ids, NULL AS slug, NULL AS title, NULL AS description,\n       NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::bigint[] AS tag_ids, NULL::bigint AS n,\n       NULL AS username, NULL AS bio, NULL AS image, NULL AS body\n  FROM pages\nUNION ALL SELECT 2, id, author_id, NULL, slug, title, description, created_at, updated_at, tag_ids, n, username, bio, image, body FROM arts\nUNION ALL SELECT 3, f.user_id, f.article_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN favorites f ON f.user_id = v.id WHERE f.article_id IN (SELECT id FROM ids)\nUNION ALL SELECT 4, fo.follower_id, fo.followee_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN follows fo ON fo.follower_id = v.id WHERE fo.followee_id IN (SELECT author_id FROM arts)\nUNION ALL SELECT 5, t.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, t.name, NULL, NULL, NULL\n  FROM tags t WHERE t.id IN (SELECT unnest(tag_ids) FROM arts)")
 
 let global_batch =
   batch_stmt
@@ -260,18 +261,21 @@ end
 type page_request = { viewer : int; limit : string; offset : string; key : string }
 type page_flags = { favorited : (int * int, unit) Hashtbl.t; following : (int * int, unit) Hashtbl.t }
 
+(* An article's JSON around the viewer's two flags: pre, favorited, mid, following, then "}}". *)
+type rendered = { author_id : int; pre : string; mid : string }
+
 (* What every request in a batch shares. An article is rendered once and only the viewer's two flags differ. *)
 type shared_page = {
   total : int;
   ids : int array;
-  articles : (int, int * Resp.article_fields) Hashtbl.t; (* id -> author id, fields *)
+  articles : (int, rendered) Hashtbl.t;
   flags : page_flags;
 }
 
 type comment_request = { c_viewer : int; c_slug : string }
 
-(* A comment's fields with the author's id, to look up whether the viewer follows them. *)
-type shared_comments = { found : bool; comments : (int * Resp.comment_fields) list; c_flags : page_flags }
+(* A comment's JSON up to its following flag, with the author's id to look that flag up. *)
+type shared_comments = { found : bool; comments : (int * string) list; c_flags : page_flags }
 
 type lanes = {
   tags_lane : (unit, Http.response) Batch.t;
@@ -481,6 +485,43 @@ let viewer_literal viewers =
 (* The strings can't hold NUL or anything an array literal would change: a request whose key could, doesn't batch. *)
 let batchable key = not (String.contains key '\000')
 
+let render_article b (r : Pg.row) tags =
+  Buffer.clear b;
+  Buffer.add_string b {|{"slug":|};
+  Json.add_string b (Pg.get r 4);
+  Buffer.add_string b {|,"title":|};
+  Json.add_string b (Pg.get r 5);
+  Buffer.add_string b {|,"description":|};
+  Json.add_string b (Pg.get r 6);
+  (match r.(14) with
+  | Some body ->
+      Buffer.add_string b {|,"body":|};
+      Json.add_string b body
+  | None -> ());
+  Buffer.add_string b {|,"tagList":[|};
+  List.iteri
+    (fun i tag ->
+      if i > 0 then Buffer.add_char b ',';
+      Json.add_string b tag)
+    tags;
+  Buffer.add_string b {|],"createdAt":"|};
+  Buffer.add_string b (timestamp r 7);
+  Buffer.add_string b {|","updatedAt":"|};
+  Buffer.add_string b (timestamp r 8);
+  Buffer.add_string b {|","favorited":|};
+  let pre = Buffer.contents b in
+  Buffer.clear b;
+  Buffer.add_string b {|,"favoritesCount":|};
+  Buffer.add_string b (string_of_int (Pg.int r 10));
+  Buffer.add_string b {|,"author":{"username":|};
+  Json.add_string b (Pg.get r 11);
+  Buffer.add_string b {|,"bio":|};
+  Json.add_option b r.(12);
+  Buffer.add_string b {|,"image":|};
+  Json.add_option b r.(13);
+  Buffer.add_string b {|,"following":|};
+  { author_id = Pg.int r 2; pre; mid = Buffer.contents b }
+
 let run_pages stmt c (inputs : page_request list) =
   let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and keys = ref [] and n = ref 0 in
   let viewers = Hashtbl.create 16 in
@@ -506,8 +547,9 @@ let run_pages stmt c (inputs : page_request list) =
       |]
   in
   let totals = Array.make (!n + 1) 0 and ids_of = Array.make (!n + 1) [||] in
-  let articles = Hashtbl.create 64 in
+  let articles = Hashtbl.create 64 and names = Hashtbl.create 64 in
   let flags = { favorited = Hashtbl.create 16; following = Hashtbl.create 16 } in
+  let raw = ref [] in
   List.iter
     (fun (r : Pg.row) ->
       match Pg.int4 r 0 with
@@ -515,43 +557,50 @@ let run_pages stmt c (inputs : page_request list) =
           let page = Pg.int r 1 in
           totals.(page) <- Pg.int r 2;
           ids_of.(page) <- Pg.int_array r 3
-      | 2 ->
-          let fields : Resp.article_fields =
-            {
-              slug = Pg.get r 4;
-              title = Pg.get r 5;
-              description = Pg.get r 6;
-              body = r.(14);
-              tagList = List.sort String.compare (Pg.text_array r 9);
-              createdAt = timestamp r 7;
-              updatedAt = timestamp r 8;
-              favorited = false;
-              favoritesCount = Pg.int r 10;
-              author = { username = Pg.get r 11; bio = r.(12); image = r.(13); following = false };
-            }
-          in
-          Hashtbl.replace articles (Pg.int r 1) (Pg.int r 2, fields)
+      | 2 -> raw := r :: !raw
       | 3 -> Hashtbl.replace flags.favorited (Pg.int r 1, Pg.int r 2) ()
-      | _ -> Hashtbl.replace flags.following (Pg.int r 1, Pg.int r 2) ())
+      | 4 -> Hashtbl.replace flags.following (Pg.int r 1, Pg.int r 2) ()
+      | _ -> Hashtbl.replace names (Pg.int r 1) (Pg.get r 11))
     rows;
+  let b = Buffer.create 2048 in
+  List.iter
+    (fun (r : Pg.row) ->
+      let tags = Array.to_list (Array.map (Hashtbl.find names) (Pg.int_array r 9)) in
+      Hashtbl.replace articles (Pg.int r 1) (render_article b r (List.sort String.compare tags)))
+    !raw;
   List.map
     (fun q ->
       let page = Hashtbl.find pages (q.limit, q.offset, q.key) in
       { total = totals.(page); ids = ids_of.(page); articles; flags })
     inputs
 
-let shared_article viewer p id : Resp.article_fields =
-  let author_id, (fields : Resp.article_fields) = Hashtbl.find p.articles id in
-  {
-    fields with
-    favorited = Hashtbl.mem p.flags.favorited (viewer, id);
-    author = { fields.author with following = Hashtbl.mem p.flags.following (viewer, author_id) };
-  }
+let add_shared_article b viewer p id =
+  let a = Hashtbl.find p.articles id in
+  Buffer.add_string b a.pre;
+  Json.add_bool b (Hashtbl.mem p.flags.favorited (viewer, id));
+  Buffer.add_string b a.mid;
+  Json.add_bool b (Hashtbl.mem p.flags.following (viewer, a.author_id));
+  Buffer.add_string b "}}"
 
 let shared_page_response viewer p =
-  respond 200
-    (Resp.articles_to_yojson
-       { articles = List.map (shared_article viewer p) (Array.to_list p.ids); articlesCount = p.total })
+  let b = Buffer.create 8192 in
+  Buffer.add_string b {|{"articles":[|};
+  Array.iteri
+    (fun i id ->
+      if i > 0 then Buffer.add_char b ',';
+      add_shared_article b viewer p id)
+    p.ids;
+  Buffer.add_string b {|],"articlesCount":|};
+  Buffer.add_string b (string_of_int p.total);
+  Buffer.add_char b '}';
+  { status = 200; body = Buffer.contents b }
+
+let shared_article_response viewer p id =
+  let b = Buffer.create 4096 in
+  Buffer.add_string b {|{"article":|};
+  add_shared_article b viewer p id;
+  Buffer.add_char b '}';
+  { status = 200; body = Buffer.contents b }
 
 let run_comments c (inputs : comment_request list) =
   let pages = Hashtbl.create 16 and slugs = ref [] and n = ref 0 and viewers = Hashtbl.create 16 in
@@ -580,6 +629,7 @@ let run_comments c (inputs : comment_request list) =
   let newest (a : Pg.row) (b : Pg.row) =
     match Int64.compare (Pg.timestamp b 4) (Pg.timestamp a 4) with 0 -> compare (Pg.int b 2) (Pg.int a 2) | n -> n
   in
+  let b = Buffer.create 1024 in
   let comments =
     Array.map
       (fun rs ->
@@ -587,16 +637,23 @@ let run_comments c (inputs : comment_request list) =
           (fun (r : Pg.row) ->
             let author_id = int_of_string (Pg.get r 6) in
             let username, bio, image = Hashtbl.find authors author_id in
-            let fields : Resp.comment_fields =
-              {
-                id = Pg.int r 2;
-                createdAt = timestamp r 4;
-                updatedAt = timestamp r 5;
-                body = Pg.get r 3;
-                author = { username; bio; image; following = false };
-              }
-            in
-            (author_id, fields))
+            Buffer.clear b;
+            Buffer.add_string b {|{"id":|};
+            Buffer.add_string b (string_of_int (Pg.int r 2));
+            Buffer.add_string b {|,"createdAt":"|};
+            Buffer.add_string b (timestamp r 4);
+            Buffer.add_string b {|","updatedAt":"|};
+            Buffer.add_string b (timestamp r 5);
+            Buffer.add_string b {|","body":|};
+            Json.add_string b (Pg.get r 3);
+            Buffer.add_string b {|,"author":{"username":|};
+            Json.add_string b username;
+            Buffer.add_string b {|,"bio":|};
+            Json.add_option b bio;
+            Buffer.add_string b {|,"image":|};
+            Json.add_option b image;
+            Buffer.add_string b {|,"following":|};
+            (author_id, Buffer.contents b))
           (List.sort newest rs))
       raw
   in
@@ -644,7 +701,7 @@ let get_article app req slug =
   | Some l when batchable slug -> (
       let p = Batch.submit l.article_lane { viewer = v.id; limit = "1"; offset = "0"; key = slug } in
       match p.ids with
-      | [| id |] -> respond 200 (Resp.article_to_yojson { article = shared_article v.id p id })
+      | [| id |] -> shared_article_response v.id p id
       | _ -> fail 404 "article not found")
   | _ -> Pg.with_conn app.pool (fun c -> full_article c 200 article_by_slug v.id (t slug))
 
@@ -710,10 +767,17 @@ let get_comments app req slug =
   | Some l when batchable slug ->
       let p = Batch.submit l.comments_lane { c_viewer = v.id; c_slug = slug } in
       if not p.found then fail 404 "article not found";
-      let comment (author_id, (fields : Resp.comment_fields)) : Resp.comment_fields =
-        { fields with author = { fields.author with following = Hashtbl.mem p.c_flags.following (v.id, author_id) } }
-      in
-      respond 200 (Resp.comments_to_yojson { comments = List.map comment p.comments })
+      let b = Buffer.create 4096 in
+      Buffer.add_string b {|{"comments":[|};
+      List.iteri
+        (fun i (author_id, pre) ->
+          if i > 0 then Buffer.add_char b ',';
+          Buffer.add_string b pre;
+          Json.add_bool b (Hashtbl.mem p.c_flags.following (v.id, author_id));
+          Buffer.add_string b "}}")
+        p.comments;
+      Buffer.add_string b "]}";
+      { status = 200; body = Buffer.contents b }
   | _ -> (
   match Pg.with_conn app.pool (fun c -> Pg.exec c list_comments [| i v.id; t slug |]) with
   | [] -> fail 404 "article not found"

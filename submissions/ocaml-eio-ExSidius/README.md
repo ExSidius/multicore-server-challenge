@@ -8,7 +8,7 @@
 | Concurrency | [Eio](https://github.com/ocaml-multicore/eio) 1.6 with `eio_linux` (io_uring): one fiber per connection, one event loop per domain |
 | HTTP | ~200 lines in `src/http.ml`: HTTP/1.1, keep-alive, `Content-Length` bodies |
 | Postgres | [postgresql-ocaml](https://github.com/mmottl/postgresql-ocaml) 5.4.0 (libpq) in non-blocking mode, awaited through Eio; prepared statements, binary results |
-| JSON | [ppx_deriving_yojson](https://github.com/ocaml-ppx/ppx_deriving_yojson) 3.10.0 on Yojson 3.0.0: serializers derived from the request and response types |
+| JSON | [ppx_deriving_yojson](https://github.com/ocaml-ppx/ppx_deriving_yojson) 3.10.0 on Yojson 3.0.0 for requests and most responses; batched reads write their JSON directly (`src/json.ml`), byte-identical |
 | bcrypt | C threads hashing up to 4 passwords at once (`src/bcrypt_stubs.c`, kernel and tables after `c-epoll-umitaltintas`), checked against libxcrypt at startup |
 | JWT | HS256 from [digestif](https://github.com/mirage/digestif) 1.4.1 |
 
@@ -28,6 +28,9 @@
   them as one statement with array parameters. An article's data is read once however many pages and viewers want it,
   and a viewer's favorites and follows are walked once. Only requests already queued when the statement starts share
   it, and nothing is kept afterwards. If a batch fails, its requests run alone, so one bad request fails only itself.
+- **An article is rendered once per batch.** Each request joins the shared JSON pieces and adds its viewer's two flags.
+- **`OCAMLRUNPARAM` trades memory for fewer collections** (`s=8M,o=400`), because each major collection scans every
+  fiber's stack. About 3 GB of RSS at 100k users.
 
 ## Development
 
