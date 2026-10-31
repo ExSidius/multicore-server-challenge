@@ -141,9 +141,11 @@ let global_batch =
   batch_stmt
     ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s) AS total,\n         ARRAY(SELECT id FROM articles ORDER BY id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input)
 
+(* A tag's count is read once however many of its pages are wanted. Proving a 1000th row is cheaper than counting 1000. *)
 let tag_batch =
   batch_stmt
-    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = t.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id ORDER BY at.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT t.id FROM tags t WHERE t.name = p.key) AS id) t")
+    ~pre:("pg AS MATERIALIZED (\n  SELECT p.ord, p.key, ARRAY(SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id ORDER BY at.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT t.id FROM tags t WHERE t.name = p.key) AS id) t),\nc AS MATERIALIZED (\n  SELECT d.key, COALESCE((SELECT 1000::bigint FROM article_tags at WHERE at.tag_id = t.id OFFSET 999 LIMIT 1),\n                        (SELECT count(*) FROM article_tags at WHERE at.tag_id = t.id)) AS total\n    FROM (SELECT DISTINCT key FROM pg) d CROSS JOIN LATERAL (SELECT (SELECT t.id FROM tags t WHERE t.name = d.key) AS id) t),\n")
+    "SELECT pg.ord, c.total, pg.ids FROM pg JOIN c ON c.key = pg.key"
 
 let author_batch =
   batch_stmt
@@ -153,9 +155,15 @@ let favorited_batch =
   batch_stmt
     ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = u.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = u.id ORDER BY f.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT u.id FROM users u WHERE u.username = p.key) AS id) u")
 
-let feed_batch =
-  batch_stmt
-    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = p.key::bigint) LIMIT 1000) s) AS total,\n         ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (p.lim + p.off)) x WHERE fo.follower_id = p.key::bigint ORDER BY x.id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input)
+(* A feed takes two statements. The first walks each followed author once, however many viewers in the batch follow
+   them, only as deep as the deepest of those viewers needs; the app merges each viewer's page from that. Rows: 1 a
+   viewer's count and followed authors, 3 an author's newest ids. $1 limits, $2 offsets, $3 viewers. The count stays per viewer,
+   where it can stop at 1000 rows in all. *)
+let feed_walk =
+  s "WITH p AS MATERIALIZED (SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[]) q(lim, off, viewer)),\nd AS MATERIALIZED (\n  SELECT g.viewer, g.n, ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id = g.viewer) AS fo\n    FROM (SELECT viewer, max(lim + off) AS n FROM p GROUP BY viewer) g),\nau AS MATERIALIZED (SELECT x.id, max(d.n) AS n FROM d CROSS JOIN LATERAL unnest(d.fo) x(id) GROUP BY x.id)\nSELECT 1 AS kind, d.viewer AS a, COALESCE((SELECT 1000::bigint FROM articles a WHERE a.author_id = ANY(d.fo) OFFSET 999 LIMIT 1),\n                                          (SELECT count(*) FROM articles a WHERE a.author_id = ANY(d.fo))) AS b, d.fo AS ids\n  FROM d\nUNION ALL SELECT 3, au.id, NULL, ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id = au.id ORDER BY a2.id DESC LIMIT au.n) FROM au"
+
+(* The second fetches the articles those pages need: $1 viewers, $2 ids, with no count of its own. *)
+let feed_fetch = batch_stmt "SELECT 1::bigint AS ord, 0::bigint AS total, $2::bigint[] AS ids"
 
 let article_batch =
   batch_stmt ~body:true
@@ -357,7 +365,22 @@ let timestamp r i =
   let d = doy - (((153 * mp) + 2) / 5) + 1 in
   let m = if mp < 10 then mp + 3 else mp - 9 in
   let y = yoe + (era * 400) + if m <= 2 then 1 else 0 in
-  Printf.sprintf "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ" y m d (sod / 3600) (sod / 60 mod 60) (sod mod 60) (ms mod 1000)
+  let b = Bytes.of_string "0000-00-00T00:00:00.000Z" in
+  let put pos width v =
+    let v = ref v in
+    for i = pos + width - 1 downto pos do
+      Bytes.unsafe_set b i (Char.unsafe_chr (48 + (!v mod 10)));
+      v := !v / 10
+    done
+  in
+  put 0 4 y;
+  put 5 2 m;
+  put 8 2 d;
+  put 11 2 (sod / 3600);
+  put 14 2 (sod / 60 mod 60);
+  put 17 2 (sod mod 60);
+  put 20 3 (ms mod 1000);
+  Bytes.unsafe_to_string b
 
 (* Columns as in list_select / full_select; the full form has the body at index 4. *)
 let article_of_row ~full (r : Pg.row) : Resp.article_fields =
@@ -592,6 +615,55 @@ let render_article b (r : Pg.row) tags =
   Buffer.add_string b {|,"following":|};
   { author_id = Pg.int r 2; pre; mid = Buffer.contents b }
 
+(* The ids of a viewer's page, from each followed author's newest ids, each array newest first. *)
+let newest_page ~lim ~off authors =
+  let n = lim + off in
+  let top = Array.make n 0 and len = ref 0 in
+  Array.iter
+    (fun ids ->
+      let continue = ref true and i = ref 0 in
+      while !continue && !i < Array.length ids do
+        let id = ids.(!i) in
+        if !len = n && id <= top.(n - 1) then continue := false
+        else begin
+          let j = ref (if !len < n then !len else n - 1) in
+          while !j > 0 && top.(!j - 1) < id do
+            top.(!j) <- top.(!j - 1);
+            decr j
+          done;
+          top.(!j) <- id;
+          if !len < n then incr len;
+          incr i
+        end
+      done)
+    authors;
+  if !len <= off then [||] else Array.sub top off (min lim (!len - off))
+
+let decode_pages rows n =
+  let totals = Array.make (n + 1) 0 and ids_of = Array.make (n + 1) [||] in
+  let articles = Hashtbl.create 64 and names = Hashtbl.create 64 in
+  let flags = { favorited = Hashtbl.create 16; following = Hashtbl.create 16 } in
+  let raw = ref [] in
+  List.iter
+    (fun (r : Pg.row) ->
+      match Pg.int4 r 0 with
+      | 1 ->
+          let page = Pg.int r 1 in
+          totals.(page) <- Pg.int r 2;
+          ids_of.(page) <- Pg.int_array r 3
+      | 2 -> raw := r :: !raw
+      | 3 -> Hashtbl.replace flags.favorited (Pg.int r 1, Pg.int r 2) ()
+      | 4 -> Hashtbl.replace flags.following (Pg.int r 1, Pg.int r 2) ()
+      | _ -> Hashtbl.replace names (Pg.int r 1) (Pg.get r 11))
+    rows;
+  let b = Buffer.create 2048 in
+  List.iter
+    (fun (r : Pg.row) ->
+      let tags = Array.to_list (Array.map (Hashtbl.find names) (Pg.int_array r 9)) in
+      Hashtbl.replace articles (Pg.int r 1) (render_article b r (List.sort String.compare tags)))
+    !raw;
+  (totals, ids_of, articles, flags)
+
 let run_pages ?(extra = fun _ -> [||]) stmt c (inputs : page_request list) =
   let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and keys = ref [] and n = ref 0 in
   let viewers = Hashtbl.create 16 in
@@ -618,32 +690,67 @@ let run_pages ?(extra = fun _ -> [||]) stmt c (inputs : page_request list) =
          |]
          (extra inputs))
   in
-  let totals = Array.make (!n + 1) 0 and ids_of = Array.make (!n + 1) [||] in
-  let articles = Hashtbl.create 64 and names = Hashtbl.create 64 in
-  let flags = { favorited = Hashtbl.create 16; following = Hashtbl.create 16 } in
-  let raw = ref [] in
-  List.iter
-    (fun (r : Pg.row) ->
-      match Pg.int4 r 0 with
-      | 1 ->
-          let page = Pg.int r 1 in
-          totals.(page) <- Pg.int r 2;
-          ids_of.(page) <- Pg.int_array r 3
-      | 2 -> raw := r :: !raw
-      | 3 -> Hashtbl.replace flags.favorited (Pg.int r 1, Pg.int r 2) ()
-      | 4 -> Hashtbl.replace flags.following (Pg.int r 1, Pg.int r 2) ()
-      | _ -> Hashtbl.replace names (Pg.int r 1) (Pg.get r 11))
-    rows;
-  let b = Buffer.create 2048 in
-  List.iter
-    (fun (r : Pg.row) ->
-      let tags = Array.to_list (Array.map (Hashtbl.find names) (Pg.int_array r 9)) in
-      Hashtbl.replace articles (Pg.int r 1) (render_article b r (List.sort String.compare tags)))
-    !raw;
+  let totals, ids_of, articles, flags = decode_pages rows !n in
   List.map
     (fun q ->
       let page = Hashtbl.find pages (q.limit, q.offset, q.key) in
       { total = totals.(page); ids = ids_of.(page); articles; flags })
+    inputs
+
+let run_feed c (inputs : page_request list) =
+  let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and viewers = ref [] in
+  List.iter
+    (fun q ->
+      if not (Hashtbl.mem pages (q.limit, q.offset, q.viewer)) then begin
+        Hashtbl.add pages (q.limit, q.offset, q.viewer) [||];
+        limits := q.limit :: !limits;
+        offsets := q.offset :: !offsets;
+        viewers := string_of_int q.viewer :: !viewers
+      end)
+    inputs;
+  let rows =
+    Pg.exec c feed_walk
+      [|
+        t ("{" ^ String.concat "," !limits ^ "}");
+        t ("{" ^ String.concat "," !offsets ^ "}");
+        t ("{" ^ String.concat "," !viewers ^ "}");
+      |]
+  in
+  let counts = Hashtbl.create 16 and follows = Hashtbl.create 16 and tops = Hashtbl.create 64 in
+  List.iter
+    (fun (r : Pg.row) ->
+      match Pg.int4 r 0 with
+      | 1 ->
+          Hashtbl.replace counts (Pg.int r 1) (Pg.int r 2);
+          Hashtbl.replace follows (Pg.int r 1) (Pg.int_array r 3)
+      | _ -> Hashtbl.replace tops (Pg.int r 1) (Pg.int_array r 3))
+    rows;
+  let wanted = Hashtbl.create 256 in
+  let merged =
+    Hashtbl.fold
+      (fun (limit, offset, viewer) _ acc ->
+        let lim = int_of_string limit and off = int_of_string offset in
+        let authors = Hashtbl.find follows viewer in
+        let ids = newest_page ~lim ~off (Array.map (Hashtbl.find tops) authors) in
+        Array.iter (fun id -> Hashtbl.replace wanted id ()) ids;
+        ((limit, offset, viewer), ids) :: acc)
+      pages []
+  in
+  let page_ids = Hashtbl.create 16 in
+  List.iter (fun (k, ids) -> Hashtbl.replace page_ids k ids) merged;
+  let viewer_set = Hashtbl.create 16 in
+  List.iter (fun q -> Hashtbl.replace viewer_set q.viewer ()) inputs;
+  let rows =
+    Pg.exec c feed_fetch
+      [| t (viewer_literal viewer_set); t (viewer_literal wanted) |]
+  in
+  let _, _, articles, flags = decode_pages rows 1 in
+  List.map
+    (fun q ->
+      (* An article deleted between the two statements just drops out, as it would between the reference's two. *)
+      let ids = Hashtbl.find page_ids (q.limit, q.offset, q.viewer) in
+      let ids = if Array.for_all (Hashtbl.mem articles) ids then ids else Array.of_list (List.filter (Hashtbl.mem articles) (Array.to_list ids)) in
+      { total = Hashtbl.find counts q.viewer; ids; articles; flags })
     inputs
 
 let add_shared_article ?favorited b viewer p id =
@@ -817,9 +924,10 @@ let feed app (req : request) =
   let v = required app req in
   let limit, offset = limit_offset (query_params req.query) in
   match app.lanes with
-  | Some l ->
+  (* The app merges a page by holding limit + offset ids, so a far-off page runs alone. *)
+  | Some l when String.length offset <= 3 ->
       shared_page_response v.id (Batch.submit l.feed_lane { viewer = v.id; limit; offset; key = string_of_int v.id })
-  | None -> Pg.with_conn app.pool (fun c -> write_list c list_feed [| i v.id; t limit; t offset |])
+  | _ -> Pg.with_conn app.pool (fun c -> write_list c list_feed [| i v.id; t limit; t offset |])
 
 let full_article c status stmt viewer key =
   match Pg.exec_one c stmt [| i viewer; key |] with

@@ -19,8 +19,8 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers domain env : unit =
     (fun (l : App.lanes) ->
       lane 1 l.tags_lane App.run_tags;
       lane 2 l.global_lane (App.run_pages App.global_batch);
-      lane 3 l.feed_lane (App.run_pages App.feed_batch);
-      lane 4 l.feed_lane (App.run_pages App.feed_batch);
+      lane 3 l.feed_lane App.run_feed;
+      lane 4 l.feed_lane App.run_feed;
       lane 5 l.tag_lane (App.run_pages App.tag_batch);
       lane 6 l.author_lane (App.run_pages App.author_batch);
       lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
