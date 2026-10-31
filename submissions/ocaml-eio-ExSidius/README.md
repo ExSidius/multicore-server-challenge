@@ -24,8 +24,9 @@
   full cost-10 hash, and nothing is kept.
 
 - **Reads and the common writes are batched across domains.** Each kind has a lane: a fiber on one domain with its own connection,
-  which takes every request waiting (from any domain), lets more arrive for `BATCH_WINDOW_MS` (default 100), and runs
-  them as one statement with array parameters. An article's data is read once however many pages and viewers want it,
+  which takes every request waiting (from any domain), lets more arrive until the oldest has waited `BATCH_WINDOW_MS`
+  (default 100), and runs them as one statement with array parameters. List lanes have `LIST_LANE_FIBERS` (default 2)
+  fibers, one collecting while the other's statement runs, so a slow statement doesn't make the next batch bigger. An article's data is read once however many pages and viewers want it,
   and a viewer's favorites and follows are walked once. Only requests already queued when the statement starts share
   it, and nothing is kept afterwards. Writes in a batch share one statement and one commit, and each response waits
   for that commit. If a batch fails, its requests run alone, so one bad request fails only itself.

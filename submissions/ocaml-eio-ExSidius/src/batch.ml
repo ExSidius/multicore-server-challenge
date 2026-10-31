@@ -1,15 +1,24 @@
-(* A lane batches requests of one kind from every domain into one execution. Its fiber takes whatever is waiting,
-   lets more arrive for [window] seconds, and runs them as one statement on its own connection. Only requests already
-   queued when the statement starts share it, and nothing is kept afterwards. *)
-type ('a, 'b) job = { input : 'a; reply : ('b, exn) result Eio.Promise.u }
-type ('a, 'b) t = { q : ('a, 'b) job Eio.Stream.t; window : float; name : string }
+(* A lane batches requests of one kind from every domain into one execution. Its fibers take turns collecting: one
+   takes whatever is waiting, lets more arrive until the oldest request has waited [window] seconds, and runs them as
+   one statement on its own connection, while the next fiber starts collecting. So a slow statement doesn't hold up
+   the requests behind it unless every fiber is busy. Only requests already queued when the statement starts share
+   it, and nothing is kept afterwards. *)
+type ('a, 'b) job = { input : 'a; reply : ('b, exn) result Eio.Promise.u; queued : float }
 
-let create ~name ~window = { q = Eio.Stream.create max_int; window; name }
+type ('a, 'b) t = {
+  q : ('a, 'b) job Eio.Stream.t;
+  collecting : Eio.Semaphore.t;
+  window : float;
+  name : string;
+}
+
+let create ~name ~window =
+  { q = Eio.Stream.create max_int; collecting = Eio.Semaphore.make 1; window; name }
 
 (* Eio's stream and promises are safe across domains. *)
 let submit t input =
   let p, reply = Eio.Promise.create () in
-  Eio.Stream.add t.q { input; reply };
+  Eio.Stream.add t.q { input; reply; queued = Unix.gettimeofday () };
   Eio.Promise.await_exn p
 
 let rec drain q acc = match Eio.Stream.take_nonblocking q with Some j -> drain q (j :: acc) | None -> List.rev acc
@@ -19,9 +28,16 @@ let run t ~clock ~url f =
   let conn = ref (Pg.connect url) in
   let jobs_n = ref 0 and runs = ref 0 and busy = ref 0. and last = ref (Stats.now ()) in
   while true do
-    let first = Eio.Stream.take t.q in
-    Eio.Time.sleep clock t.window;
-    let jobs = first :: drain t.q [] in
+    let jobs =
+      Eio.Semaphore.acquire t.collecting;
+      Fun.protect
+        ~finally:(fun () -> Eio.Semaphore.release t.collecting)
+        (fun () ->
+          let first = Eio.Stream.take t.q in
+          let left = first.queued +. t.window -. Unix.gettimeofday () in
+          if left > 0. then Eio.Time.sleep clock left;
+          first :: drain t.q [])
+    in
     let t0 = if Stats.enabled then Stats.now () else 0. in
     if not !conn.alive then conn := Pg.connect url;
     (match f !conn (List.map (fun j -> j.input) jobs) with

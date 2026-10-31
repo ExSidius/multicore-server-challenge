@@ -20,7 +20,7 @@ NAME="$(basename "$SUB")"
 if [ -z "${AWS_CONFIG_FILE:-}" ]; then export DIRENV_LOG_FORMAT=""; exec direnv exec "$ROOT" bash "$0" "$@"; fi
 export AWS_PAGER=""
 STATE="$SUB/dev/results/aws/fast.state"
-SSH_OPTS=(-i "$HOME/.ssh/id_ed_personal" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+SSH_OPTS=(-i "$HOME/.ssh/id_ed_personal" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o StrictHostKeyChecking=accept-new)
 SECRET=multicore-server-challenge
 SETTLE=40; WINDOW=20; RAMP=10
 

@@ -4,7 +4,7 @@ let getenv k default = match Sys.getenv_opt k with Some v when v <> "" -> v | _ 
 let getenv_int k default = int_of_string (getenv k (string_of_int default))
 let queue_depth = 4096
 
-let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers domain env : unit =
+let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers domain env : unit =
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
   let app = App.{ pool = Pg.create_pool ~size:pool_size db; secret; lanes } in
@@ -15,15 +15,21 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers domain env : unit =
   let lane home l f =
     if ((home - 1) mod workers) + 1 = domain then Eio.Fiber.fork ~sw (fun () -> Batch.run l ~clock ~url:db f)
   in
+  (* The list statements are the slow ones, so they get several fibers, on consecutive domains. Write lanes keep one:
+     concurrent batches could lock the same rows in different orders. *)
+  let list_lane home l f =
+    for i = 0 to list_fibers - 1 do
+      lane (home + i) l f
+    done
+  in
   Option.iter
     (fun (l : App.lanes) ->
       lane 1 l.tags_lane App.run_tags;
-      lane 2 l.global_lane (App.run_pages App.global_batch);
-      lane 3 l.feed_lane App.run_feed;
-      lane 4 l.feed_lane App.run_feed;
-      lane 5 l.tag_lane (App.run_pages App.tag_batch);
-      lane 6 l.author_lane (App.run_pages App.author_batch);
-      lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
+      list_lane 2 l.global_lane (App.run_pages App.global_batch);
+      list_lane 3 l.feed_lane App.run_feed;
+      list_lane 5 l.tag_lane (App.run_pages App.tag_batch);
+      list_lane 6 l.author_lane (App.run_pages App.author_batch);
+      list_lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
       lane 2 l.article_lane (App.run_pages App.article_batch);
       lane 3 l.comments_lane App.run_comments;
       lane 4 l.profile_lane App.run_profiles;
@@ -83,7 +89,8 @@ let () =
             unfollow_lane = lane "unfollow";
           }
   in
-  let serve = serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers in
+  let list_fibers = max 1 (getenv_int "LIST_LANE_FIBERS" 2) in
+  let serve = serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers in
   try
     Bcrypt.start
       ~threads:(max 1 (getenv_int "BCRYPT_THREADS" 2))

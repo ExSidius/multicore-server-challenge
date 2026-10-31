@@ -19,7 +19,7 @@ NAME="$(basename "$SUB")"
 if [ -z "${AWS_CONFIG_FILE:-}" ]; then export DIRENV_LOG_FORMAT=""; exec direnv exec "$ROOT" bash "$0" "$@"; fi
 export AWS_PAGER=""
 KEY="$HOME/.ssh/id_ed_personal"
-SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o StrictHostKeyChecking=accept-new)
 
 instance() { # name query
   aws ec2 describe-instances --filters "Name=tag:Name,Values=$1" Name=instance-state-name,Values=pending,running,stopping,stopped \
