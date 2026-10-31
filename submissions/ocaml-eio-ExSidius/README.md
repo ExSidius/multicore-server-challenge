@@ -14,7 +14,7 @@
 
 ## Design
 
-- **Domains.** `WORKERS` (default 2) domains each run an event loop with their own `SO_REUSEPORT` listener and share
+- **Domains.** `WORKERS` (default 6) domains each run an event loop with their own `SO_REUSEPORT` listener and share
   of the Postgres connections. `BCRYPT_THREADS` (default 2) plain C threads do the hashing at `BCRYPT_NICE` (default 19).
 - **`PG_CONNECTIONS`** (default 30) is split evenly between network domains. A request holds one connection for all
   its statements. The reference SQL runs unchanged and is prepared once per connection.
@@ -24,15 +24,14 @@
   full cost-10 hash, and nothing is kept.
 
 - **Reads and the common writes are batched across domains.** Each kind has a lane: a fiber on one domain with its own connection,
-  which takes every request waiting (from any domain), lets more arrive for `BATCH_WINDOW_MS` (default 150), and runs
+  which takes every request waiting (from any domain), lets more arrive for `BATCH_WINDOW_MS` (default 100), and runs
   them as one statement with array parameters. An article's data is read once however many pages and viewers want it,
   and a viewer's favorites and follows are walked once. Only requests already queued when the statement starts share
   it, and nothing is kept afterwards. Writes in a batch share one statement and one commit, and each response waits
   for that commit. If a batch fails, its requests run alone, so one bad request fails only itself.
 - **An article is rendered once per batch.** Each request joins the shared JSON pieces and adds its viewer's two flags.
-- **`OCAMLRUNPARAM` trades memory for fewer collections** (`s=32M,o=400`), because each major collection scans every
-  fiber's stack. Two domains are enough at 100k users, since batching leaves them little to do, and fewer domains
-  mean fewer wake-ups and less collection coordination. About 3 GB of RSS at 100k users.
+- **`OCAMLRUNPARAM` trades memory for fewer collections** (`s=8M,o=400`), because each major collection scans every
+  fiber's stack. About 3 GB of RSS at 100k users.
 
 ## Development
 

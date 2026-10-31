@@ -100,7 +100,7 @@ run() {
   line=$(jq -r '[(.overall.rps | round), .overall.p50_ms, .overall.p95_ms, .overall.p99_ms, (.overall.error_rate * 100), (if .verdict.pass then "PASS" else "FAIL" end), .verdict.lg_limited] | @tsv' "$dir/merged.json")
   [ -f "$HISTORY" ] || echo "$HISTORY_HEADER" > "$HISTORY"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Iseconds)" "$SHA" "${LABEL:-}" "$SEED" "$phase" \
-    "${WORKERS:-2}+${BCRYPT_THREADS:-2}" "${PG_CONNECTIONS:-30}" "$users" "$boxes" "$scale" "$line" "$app_pct" "$pg_pct" "$rss" "$RUN_ID" >> "$HISTORY"
+    "${WORKERS:-6}+${BCRYPT_THREADS:-2}" "${PG_CONNECTIONS:-30}" "$users" "$boxes" "$scale" "$line" "$app_pct" "$pg_pct" "$rss" "$RUN_ID" >> "$HISTORY"
   printf '%-8s users=%-7s boxes=%-3s scale=%-4s | %s | app %s%% pg %s%% rss %sMB\n' "$phase" "$users" "$boxes" "$scale" "$(tr '\t' ' ' <<<"$line")" "$app_pct" "$pg_pct" "$rss" | tee -a "$RUN_DIR/summary.txt"
   if [ "$(jq -r .verdict.lg_limited "$dir/merged.json")" = true ]; then
     echo "load generator limited at $users: this result says nothing about the server" | tee -a "$RUN_DIR/summary.txt"; LG_LIMITED=1

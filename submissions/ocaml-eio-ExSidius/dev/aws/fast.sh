@@ -9,6 +9,7 @@
 #   dev/aws/fast.sh ab "K=V ..." [settle] [secs]  # A/B/A: current settings, these settings, current settings again
 #   dev/aws/fast.sh trend [secs]         # p50/p95/p99 and req/s in steps, to watch latency climb
 #   dev/aws/fast.sh reset [users]        # restore the seed without restarting Postgres, restart load (no reseed)
+#   dev/aws/fast.sh load [users]         # restart only the load generator, keeping the database as it is
 #   dev/aws/fast.sh stop                 # stop the load, keep everything warm
 #   dev/aws/fast.sh down                 # stop the load and both boxes
 set -euo pipefail
@@ -21,7 +22,7 @@ export AWS_PAGER=""
 STATE="$SUB/dev/results/aws/fast.state"
 SSH_OPTS=(-i "$HOME/.ssh/id_ed_personal" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 SECRET=multicore-server-challenge
-SETTLE=15; WINDOW=15; RAMP=10
+SETTLE=40; WINDOW=20; RAMP=10
 
 on_target() { ssh "${SSH_OPTS[@]}" "ubuntu@$TARGET" "$@"; }
 on_loadgen() { ssh "${SSH_OPTS[@]}" "ubuntu@$LOADGEN" "$@"; }
@@ -110,7 +111,8 @@ case "${1:-}" in
     load_state; USERS="${2:-$USERS}"; t=$SECONDS; stop_load
     on_target "sudo systemctl stop challenge; sudo -u postgres psql -qX -v ON_ERROR_STOP=1 -c \"DROP DATABASE IF EXISTS conduit WITH (FORCE)\" -c \"CREATE DATABASE conduit TEMPLATE conduit_seed STRATEGY FILE_COPY\""
     restart_app; sed -i "s/^USERS=.*/USERS=$USERS/" "$STATE"; start_load "$USERS"; echo "database restored and load restarted in $((SECONDS - t)) s: $USERS users" ;;
+  load) load_state; USERS="${2:-$USERS}"; stop_load; sed -i "s/^USERS=.*/USERS=$USERS/" "$STATE"; start_load "$USERS"; echo "load restarted, database kept: $USERS users" ;;
   stop) load_state; stop_load; echo "load stopped" ;;
   down) load_state; stop_load; bash "$HERE/aws.sh" down; rm -f "$STATE" ;;
-  *) sed -n 2,14p "$0"; exit 2 ;;
+  *) sed -n 2,15p "$0"; exit 2 ;;
 esac
