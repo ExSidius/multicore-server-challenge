@@ -58,7 +58,7 @@ let () =
   let workers = max 1 (getenv_int "WORKERS" 6) in
   let pool_size = max 1 (getenv_int "PG_CONNECTIONS" 30 / workers) in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-  let window = float (getenv_int "BATCH_WINDOW_MS" 100) /. 1000. in
+  let window = float (getenv_int "BATCH_WINDOW_MS" 150) /. 1000. in
   let lanes =
     if window <= 0. then None
     else
