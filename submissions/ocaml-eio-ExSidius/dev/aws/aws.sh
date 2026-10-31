@@ -9,6 +9,7 @@
 #   dev/aws/aws.sh fetch <label>       # copy that run's results and telemetry to dev/results/aws/<label>
 #   dev/aws/aws.sh pgprofile <label> [users]      # fixed load with pg_stat_statements and perf; prints the profile
 #   dev/aws/aws.sh hold <label> <users>           # conformance, fresh database, then a 5-minute hold with no profilers
+#   dev/aws/fast.sh                               # quick experiments under running load, see there
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SUB="$(cd "$HERE/../.." && pwd)"
@@ -120,6 +121,7 @@ case "${1:-}" in
     rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$LOADGEN:/root/holds/$LABEL/merged.json" "$DEST/"
     rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$TARGET:/root/telemetry/$LABEL/" "$DEST/telemetry/"
     echo "$DEST" ;;
+  urls) resolve; target_urls ;;
   fetch)
     LABEL="${2:?usage: aws.sh fetch <label>}"; resolve
     DEST="$SUB/dev/results/aws/$LABEL"; mkdir -p "$DEST"

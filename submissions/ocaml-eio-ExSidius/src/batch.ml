@@ -17,11 +17,12 @@ let rec drain q acc = match Eio.Stream.take_nonblocking q with Some j -> drain q
 (* [f] gets the inputs in order and returns one result per input. *)
 let run t ~clock ~url f =
   let conn = ref (Pg.connect url) in
-  let jobs_n = ref 0 and runs = ref 0 and last = ref (Stats.now ()) in
+  let jobs_n = ref 0 and runs = ref 0 and busy = ref 0. and last = ref (Stats.now ()) in
   while true do
     let first = Eio.Stream.take t.q in
     Eio.Time.sleep clock t.window;
     let jobs = first :: drain t.q [] in
+    let t0 = if Stats.enabled then Stats.now () else 0. in
     if not !conn.alive then conn := Pg.connect url;
     (match f !conn (List.map (fun j -> j.input) jobs) with
     | results -> List.iter2 (fun j r -> Eio.Promise.resolve_ok j.reply r) jobs results
@@ -41,11 +42,14 @@ let run t ~clock ~url f =
       jobs_n := !jobs_n + List.length jobs;
       incr runs;
       let t1 = Stats.now () in
+      busy := !busy +. (t1 -. t0);
       if t1 -. !last >= 1. then begin
-        Printf.eprintf "batch lane=%s runs=%d jobs=%d avg=%.1f\n%!" t.name !runs !jobs_n
-          (float !jobs_n /. float !runs);
+        Printf.eprintf "batch lane=%s runs=%d jobs=%d avg=%.1f ms=%.1f\n%!" t.name !runs !jobs_n
+          (float !jobs_n /. float !runs)
+          (1000. *. !busy /. float !runs);
         jobs_n := 0;
         runs := 0;
+        busy := 0.;
         last := t1
       end
     end
