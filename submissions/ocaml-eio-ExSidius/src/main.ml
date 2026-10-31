@@ -25,7 +25,14 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers domain env : unit =
       lane 6 l.author_lane (App.run_pages App.author_batch);
       lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
       lane 2 l.article_lane (App.run_pages App.article_batch);
-      lane 3 l.comments_lane App.run_comments)
+      lane 3 l.comments_lane App.run_comments;
+      lane 4 l.profile_lane App.run_profiles;
+      lane 5 l.user_lane App.run_users;
+      lane 6 l.favorite_lane (App.run_favorites App.favorite_batch);
+      lane 1 l.unfavorite_lane (App.run_favorites App.unfavorite_batch);
+      lane 2 l.add_comment_lane App.run_add_comments;
+      lane 4 l.follow_lane (App.run_follows App.follow_batch);
+      lane 5 l.unfollow_lane (App.run_follows App.unfollow_batch))
     lanes;
   Eio.Fiber.fork ~sw (fun () ->
       Stats.reporter ~clock ~domain ~pool_free:(fun () -> Eio.Stream.length app.pool.q));
@@ -51,7 +58,7 @@ let () =
   let workers = max 1 (getenv_int "WORKERS" 6) in
   let pool_size = max 1 (getenv_int "PG_CONNECTIONS" 30 / workers) in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-  let window = float (getenv_int "BATCH_WINDOW_MS" 10) /. 1000. in
+  let window = float (getenv_int "BATCH_WINDOW_MS" 100) /. 1000. in
   let lanes =
     if window <= 0. then None
     else
@@ -67,6 +74,13 @@ let () =
             favorited_lane = lane "favorited";
             article_lane = lane "article";
             comments_lane = lane "comments";
+            profile_lane = lane "profile";
+            user_lane = lane "user";
+            favorite_lane = lane "favorite";
+            unfavorite_lane = lane "unfavorite";
+            add_comment_lane = lane "add_comment";
+            follow_lane = lane "follow";
+            unfollow_lane = lane "unfollow";
           }
   in
   let serve = serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers in

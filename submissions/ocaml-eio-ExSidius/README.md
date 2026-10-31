@@ -23,11 +23,12 @@
   400) for others to share its batch, unless no other login arrived recently. Every password still gets its own
   full cost-10 hash, and nothing is kept.
 
-- **Reads are batched across domains.** Each kind of read has a lane: a fiber on one domain with its own connection,
-  which takes every request waiting (from any domain), lets more arrive for `BATCH_WINDOW_MS` (default 10), and runs
+- **Reads and the common writes are batched across domains.** Each kind has a lane: a fiber on one domain with its own connection,
+  which takes every request waiting (from any domain), lets more arrive for `BATCH_WINDOW_MS` (default 100), and runs
   them as one statement with array parameters. An article's data is read once however many pages and viewers want it,
   and a viewer's favorites and follows are walked once. Only requests already queued when the statement starts share
-  it, and nothing is kept afterwards. If a batch fails, its requests run alone, so one bad request fails only itself.
+  it, and nothing is kept afterwards. Writes in a batch share one statement and one commit, and each response waits
+  for that commit. If a batch fails, its requests run alone, so one bad request fails only itself.
 - **An article is rendered once per batch.** Each request joins the shared JSON pieces and adds its viewer's two flags.
 - **`OCAMLRUNPARAM` trades memory for fewer collections** (`s=8M,o=400`), because each major collection scans every
   fiber's stack. About 3 GB of RSS at 100k users.
