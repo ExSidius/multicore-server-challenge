@@ -23,7 +23,11 @@
   400) for others to share its batch, unless no other login arrived recently. Every password still gets its own
   full cost-10 hash, and nothing is kept.
 
-This is a first prototype: no pipelining, no query batching and no SQL changes yet.
+- **Reads are batched across domains.** Each kind of read has a lane: a fiber on one domain with its own connection,
+  which takes every request waiting (from any domain), lets more arrive for `BATCH_WINDOW_MS` (default 10), and runs
+  them as one statement with array parameters. An article's data is read once however many pages and viewers want it,
+  and a viewer's favorites and follows are walked once. Only requests already queued when the statement starts share
+  it, and nothing is kept afterwards. If a batch fails, its requests run alone, so one bad request fails only itself.
 
 ## Development
 

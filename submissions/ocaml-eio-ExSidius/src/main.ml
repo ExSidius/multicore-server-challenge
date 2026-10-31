@@ -4,13 +4,29 @@ let getenv k default = match Sys.getenv_opt k with Some v when v <> "" -> v | _ 
 let getenv_int k default = int_of_string (getenv k (string_of_int default))
 let queue_depth = 4096
 
-let serve ~host ~port ~db ~pool_size ~secret domain env : unit =
+let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers domain env : unit =
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
-  let app = App.{ pool = Pg.create_pool ~size:pool_size db; secret } in
+  let app = App.{ pool = Pg.create_pool ~size:pool_size db; secret; lanes } in
   let addr = `Tcp (Eio_unix.Net.Ipaddr.of_unix (Unix.inet_addr_of_string host), port) in
   let sock = Eio.Net.listen ~sw ~reuse_addr:true ~reuse_port:true ~backlog:65535 net addr in
   let clock = Eio.Stdenv.clock env in
+  (* Each lane's fiber lives on one domain, which does its decoding and rendering of shared rows. *)
+  let lane home l f =
+    if ((home - 1) mod workers) + 1 = domain then Eio.Fiber.fork ~sw (fun () -> Batch.run l ~clock ~url:db f)
+  in
+  Option.iter
+    (fun (l : App.lanes) ->
+      lane 1 l.tags_lane App.run_tags;
+      lane 2 l.global_lane (App.run_pages App.global_batch);
+      lane 3 l.feed_lane (App.run_pages App.feed_batch);
+      lane 4 l.feed_lane (App.run_pages App.feed_batch);
+      lane 5 l.tag_lane (App.run_pages App.tag_batch);
+      lane 6 l.author_lane (App.run_pages App.author_batch);
+      lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
+      lane 2 l.article_lane (App.run_pages App.article_batch);
+      lane 3 l.comments_lane App.run_comments)
+    lanes;
   Eio.Fiber.fork ~sw (fun () ->
       Stats.reporter ~clock ~domain ~pool_free:(fun () -> Eio.Stream.length app.pool.q));
   let on_error e = Printf.eprintf "connection error: %s\n%!" (Printexc.to_string e) in
@@ -35,7 +51,25 @@ let () =
   let workers = max 1 (getenv_int "WORKERS" 6) in
   let pool_size = max 1 (getenv_int "PG_CONNECTIONS" 30 / workers) in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-  let serve = serve ~host ~port ~db ~pool_size ~secret in
+  let window = float (getenv_int "BATCH_WINDOW_MS" 10) /. 1000. in
+  let lanes =
+    if window <= 0. then None
+    else
+      let lane name = Batch.create ~name ~window in
+      Some
+        App.
+          {
+            tags_lane = lane "tags";
+            global_lane = lane "global";
+            feed_lane = lane "feed";
+            tag_lane = lane "tag";
+            author_lane = lane "author";
+            favorited_lane = lane "favorited";
+            article_lane = lane "article";
+            comments_lane = lane "comments";
+          }
+  in
+  let serve = serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers in
   try
     Bcrypt.start
       ~threads:(max 1 (getenv_int "BCRYPT_THREADS" 2))

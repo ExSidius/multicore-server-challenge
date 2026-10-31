@@ -5,8 +5,6 @@ exception Fail of int * string
 
 let fail status msg = raise (Fail (status, msg))
 
-type t = { pool : Pg.pool; secret : string }
-
 (* ---------- SQL ---------- *)
 
 (* Postgres is the bottleneck, so each endpoint makes one round trip where it can: a lookup and the statement that
@@ -121,7 +119,50 @@ let insert_comment =
 
 let comment_author = s "SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id\n WHERE c.id = $1 AND a.slug = $2"
 let delete_comment = s "DELETE FROM comments WHERE id = $1"
-let all_tags = s "SELECT name FROM tags ORDER BY name"
+let all_tags = s "SELECT ARRAY(SELECT name FROM tags ORDER BY name)"
+
+(* ---------- batched reads ---------- *)
+
+(* One statement serves every request in a batch. Pages is one row per distinct page: its ordinal, count and ids, from
+   $2 limits, $3 offsets and $4 keys (a tag, a username, a viewer or a slug). An article's own data is read once
+   however many pages and viewers want it, and each of the viewers in $1 has their favorites and follows walked once,
+   as a single list's hashed subplans do. Rows, told apart by kind: 1 a page, 2 an article, 3 a favorite, 4 a follow.
+   Tags come unsorted: the app sorts them, which is the same order under the database's C.UTF-8 collation. *)
+let page_input = "unnest($2::int[], $3::bigint[], $4::text[]) WITH ORDINALITY p(lim, off, key, ord)"
+
+let batch_stmt ?(body = false) pages =
+  s ("WITH pages AS MATERIALIZED (" ^ pages
+    ^ "),\nids AS MATERIALIZED (SELECT DISTINCT unnest(ids) AS id FROM pages),\narts AS MATERIALIZED (\n  SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, "
+    ^ (if body then "a.body" else "NULL::text AS body")
+    ^ ",\n         ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name FROM article_tags at WHERE at.article_id = a.id) AS tag_list,\n         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS n, u.username, u.bio, u.image\n    FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id)\nSELECT 1 AS kind, ord::bigint AS id, total AS x, ids, NULL AS slug, NULL AS title, NULL AS description,\n       NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text[] AS tag_list, NULL::bigint AS n,\n       NULL AS username, NULL AS bio, NULL AS image, NULL AS body\n  FROM pages\nUNION ALL SELECT 2, id, author_id, NULL, slug, title, description, created_at, updated_at, tag_list, n, username, bio, image, body FROM arts\nUNION ALL SELECT 3, f.user_id, f.article_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN favorites f ON f.user_id = v.id WHERE f.article_id IN (SELECT id FROM ids)\nUNION ALL SELECT 4, fo.follower_id, fo.followee_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN follows fo ON fo.follower_id = v.id WHERE fo.followee_id IN (SELECT author_id FROM arts)")
+
+let global_batch =
+  batch_stmt
+    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s) AS total,\n         ARRAY(SELECT id FROM articles ORDER BY id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input)
+
+let tag_batch =
+  batch_stmt
+    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = t.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id ORDER BY at.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT t.id FROM tags t WHERE t.name = p.key) AS id) t")
+
+let author_batch =
+  batch_stmt
+    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = u.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id = u.id ORDER BY a2.id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT u.id FROM users u WHERE u.username = p.key) AS id) u")
+
+let favorited_batch =
+  batch_stmt
+    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = u.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = u.id ORDER BY f.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT u.id FROM users u WHERE u.username = p.key) AS id) u")
+
+let feed_batch =
+  batch_stmt
+    ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = p.key::bigint) LIMIT 1000) s) AS total,\n         ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (p.lim + p.off)) x WHERE fo.follower_id = p.key::bigint ORDER BY x.id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input)
+
+let article_batch =
+  batch_stmt ~body:true
+    ("SELECT p.ord, 0::bigint AS total, ARRAY(SELECT a.id FROM articles a WHERE a.slug = p.key) AS ids\n    FROM " ^ page_input ^ " WHERE p.lim + p.off >= 0")
+
+(* $1 viewers, $2 slugs. Rows: 1 an article that exists, 2 a comment, 3 a comment's author, 4 a follow. *)
+let comments_batch =
+  s "WITH p AS MATERIALIZED (\n  SELECT q.ord, (SELECT a.id FROM articles a WHERE a.slug = q.slug) AS id FROM unnest($2::text[]) WITH ORDINALITY q(slug, ord)),\nc AS MATERIALIZED (\n  SELECT p.ord, x.id, x.body, x.created_at, x.updated_at, x.author_id FROM p CROSS JOIN LATERAL (\n    SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c WHERE c.article_id = p.id\n     ORDER BY c.created_at DESC, c.id DESC LIMIT 100) x),\nau AS MATERIALIZED (SELECT DISTINCT author_id AS id FROM c)\nSELECT 1 AS kind, ord::bigint AS a, NULL::bigint AS b, NULL AS body, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL AS username, NULL AS bio, NULL AS image\n  FROM p WHERE id IS NOT NULL\nUNION ALL SELECT 2, ord, id, body, created_at, updated_at, author_id::text, NULL, NULL FROM c\nUNION ALL SELECT 3, u.id, NULL, NULL, NULL, NULL, u.username, u.bio, u.image FROM au JOIN users u ON u.id = au.id\nUNION ALL SELECT 4, fo.follower_id, fo.followee_id, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN follows fo ON fo.follower_id = v.id WHERE fo.followee_id IN (SELECT id FROM au)"
 
 (* Byte-identical to trim(both '-' from lower(regexp_replace(x, '[^A-Za-z0-9]+', '-', 'g'))): every byte of a
    multi-byte character is outside the class, so working on bytes gives the same result. *)
@@ -215,6 +256,35 @@ module Resp = struct
   type error_fields = { body : string list } [@@deriving to_yojson]
   type error = { errors : error_fields } [@@deriving to_yojson]
 end
+
+type page_request = { viewer : int; limit : string; offset : string; key : string }
+type page_flags = { favorited : (int * int, unit) Hashtbl.t; following : (int * int, unit) Hashtbl.t }
+
+(* What every request in a batch shares. An article is rendered once and only the viewer's two flags differ. *)
+type shared_page = {
+  total : int;
+  ids : int array;
+  articles : (int, int * Resp.article_fields) Hashtbl.t; (* id -> author id, fields *)
+  flags : page_flags;
+}
+
+type comment_request = { c_viewer : int; c_slug : string }
+
+(* A comment's fields with the author's id, to look up whether the viewer follows them. *)
+type shared_comments = { found : bool; comments : (int * Resp.comment_fields) list; c_flags : page_flags }
+
+type lanes = {
+  tags_lane : (unit, Http.response) Batch.t;
+  global_lane : (page_request, shared_page) Batch.t;
+  feed_lane : (page_request, shared_page) Batch.t;
+  tag_lane : (page_request, shared_page) Batch.t;
+  author_lane : (page_request, shared_page) Batch.t;
+  favorited_lane : (page_request, shared_page) Batch.t;
+  article_lane : (page_request, shared_page) Batch.t;
+  comments_lane : (comment_request, shared_comments) Batch.t;
+}
+
+type t = { pool : Pg.pool; secret : string; lanes : lanes option }
 
 let respond status json = { status; body = Yojson.Safe.to_string json }
 let error_body msg = Yojson.Safe.to_string (Resp.error_to_yojson { errors = { body = [ msg ] } })
@@ -405,24 +475,163 @@ let write_list c list params =
 let non_empty_param params k =
   match List.assoc_opt k params with Some "" | None -> None | some -> some
 
+let viewer_literal viewers =
+  "{" ^ String.concat "," (Hashtbl.fold (fun v () acc -> string_of_int v :: acc) viewers []) ^ "}"
+
+(* The strings can't hold NUL or anything an array literal would change: a request whose key could, doesn't batch. *)
+let batchable key = not (String.contains key '\000')
+
+let run_pages stmt c (inputs : page_request list) =
+  let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and keys = ref [] and n = ref 0 in
+  let viewers = Hashtbl.create 16 in
+  List.iter
+    (fun q ->
+      if q.viewer <> 0 then Hashtbl.replace viewers q.viewer ();
+      let k = (q.limit, q.offset, q.key) in
+      if not (Hashtbl.mem pages k) then begin
+        incr n;
+        Hashtbl.add pages k !n;
+        limits := q.limit :: !limits;
+        offsets := q.offset :: !offsets;
+        keys := q.key :: !keys
+      end)
+    inputs;
+  let rows =
+    Pg.exec c stmt
+      [|
+        t (viewer_literal viewers);
+        t ("{" ^ String.concat "," (List.rev !limits) ^ "}");
+        t ("{" ^ String.concat "," (List.rev !offsets) ^ "}");
+        t (Pg.text_array_literal (List.rev !keys));
+      |]
+  in
+  let totals = Array.make (!n + 1) 0 and ids_of = Array.make (!n + 1) [||] in
+  let articles = Hashtbl.create 64 in
+  let flags = { favorited = Hashtbl.create 16; following = Hashtbl.create 16 } in
+  List.iter
+    (fun (r : Pg.row) ->
+      match Pg.int4 r 0 with
+      | 1 ->
+          let page = Pg.int r 1 in
+          totals.(page) <- Pg.int r 2;
+          ids_of.(page) <- Pg.int_array r 3
+      | 2 ->
+          let fields : Resp.article_fields =
+            {
+              slug = Pg.get r 4;
+              title = Pg.get r 5;
+              description = Pg.get r 6;
+              body = r.(14);
+              tagList = List.sort String.compare (Pg.text_array r 9);
+              createdAt = timestamp r 7;
+              updatedAt = timestamp r 8;
+              favorited = false;
+              favoritesCount = Pg.int r 10;
+              author = { username = Pg.get r 11; bio = r.(12); image = r.(13); following = false };
+            }
+          in
+          Hashtbl.replace articles (Pg.int r 1) (Pg.int r 2, fields)
+      | 3 -> Hashtbl.replace flags.favorited (Pg.int r 1, Pg.int r 2) ()
+      | _ -> Hashtbl.replace flags.following (Pg.int r 1, Pg.int r 2) ())
+    rows;
+  List.map
+    (fun q ->
+      let page = Hashtbl.find pages (q.limit, q.offset, q.key) in
+      { total = totals.(page); ids = ids_of.(page); articles; flags })
+    inputs
+
+let shared_article viewer p id : Resp.article_fields =
+  let author_id, (fields : Resp.article_fields) = Hashtbl.find p.articles id in
+  {
+    fields with
+    favorited = Hashtbl.mem p.flags.favorited (viewer, id);
+    author = { fields.author with following = Hashtbl.mem p.flags.following (viewer, author_id) };
+  }
+
+let shared_page_response viewer p =
+  respond 200
+    (Resp.articles_to_yojson
+       { articles = List.map (shared_article viewer p) (Array.to_list p.ids); articlesCount = p.total })
+
+let run_comments c (inputs : comment_request list) =
+  let pages = Hashtbl.create 16 and slugs = ref [] and n = ref 0 and viewers = Hashtbl.create 16 in
+  List.iter
+    (fun q ->
+      if q.c_viewer <> 0 then Hashtbl.replace viewers q.c_viewer ();
+      if not (Hashtbl.mem pages q.c_slug) then begin
+        incr n;
+        Hashtbl.add pages q.c_slug !n;
+        slugs := q.c_slug :: !slugs
+      end)
+    inputs;
+  let rows = Pg.exec c comments_batch [| t (viewer_literal viewers); t (Pg.text_array_literal (List.rev !slugs)) |] in
+  let found = Array.make (!n + 1) false and raw = Array.make (!n + 1) [] in
+  let authors = Hashtbl.create 32 in
+  let flags = { favorited = Hashtbl.create 1; following = Hashtbl.create 16 } in
+  List.iter
+    (fun (r : Pg.row) ->
+      match Pg.int4 r 0 with
+      | 1 -> found.(Pg.int r 1) <- true
+      | 2 -> raw.(Pg.int r 1) <- r :: raw.(Pg.int r 1)
+      | 3 -> Hashtbl.replace authors (Pg.int r 1) (Pg.get r 6, r.(7), r.(8))
+      | _ -> Hashtbl.replace flags.following (Pg.int r 1, Pg.int r 2) ())
+    rows;
+  (* Newest first, as the reference orders them. *)
+  let newest (a : Pg.row) (b : Pg.row) =
+    match Int64.compare (Pg.timestamp b 4) (Pg.timestamp a 4) with 0 -> compare (Pg.int b 2) (Pg.int a 2) | n -> n
+  in
+  let comments =
+    Array.map
+      (fun rs ->
+        List.map
+          (fun (r : Pg.row) ->
+            let author_id = int_of_string (Pg.get r 6) in
+            let username, bio, image = Hashtbl.find authors author_id in
+            let fields : Resp.comment_fields =
+              {
+                id = Pg.int r 2;
+                createdAt = timestamp r 4;
+                updatedAt = timestamp r 5;
+                body = Pg.get r 3;
+                author = { username; bio; image; following = false };
+              }
+            in
+            (author_id, fields))
+          (List.sort newest rs))
+      raw
+  in
+  List.map
+    (fun q ->
+      let page = Hashtbl.find pages q.c_slug in
+      { found = found.(page); comments = comments.(page); c_flags = flags })
+    inputs
+
 let list_articles app (req : request) =
   let v = optional app req in
   let params = query_params req.query in
   let limit, offset = limit_offset params in
   let base = [| i v.id; t limit; t offset |] in
-  let filtered list value =
-    Pg.with_conn app.pool (fun c -> write_list c list (Array.append base [| t value |]))
+  let filtered lane list key =
+    match app.lanes with
+    | Some lanes when batchable key ->
+        shared_page_response v.id (Batch.submit (lane lanes) { viewer = v.id; limit; offset; key })
+    | _ ->
+        let params = if key = "" then base else Array.append base [| t key |] in
+        Pg.with_conn app.pool (fun c -> write_list c list params)
   in
   match (non_empty_param params "tag", non_empty_param params "author", non_empty_param params "favorited") with
-  | Some tag, _, _ -> filtered list_tag tag
-  | None, Some author, _ -> filtered list_author author
-  | None, None, Some user -> filtered list_favorited user
-  | None, None, None -> Pg.with_conn app.pool (fun c -> write_list c list_all base)
+  | Some tag, _, _ -> filtered (fun l -> l.tag_lane) list_tag tag
+  | None, Some author, _ -> filtered (fun l -> l.author_lane) list_author author
+  | None, None, Some user -> filtered (fun l -> l.favorited_lane) list_favorited user
+  | None, None, None -> filtered (fun l -> l.global_lane) list_all ""
 
 let feed app (req : request) =
   let v = required app req in
   let limit, offset = limit_offset (query_params req.query) in
-  Pg.with_conn app.pool (fun c -> write_list c list_feed [| i v.id; t limit; t offset |])
+  match app.lanes with
+  | Some l ->
+      shared_page_response v.id (Batch.submit l.feed_lane { viewer = v.id; limit; offset; key = string_of_int v.id })
+  | None -> Pg.with_conn app.pool (fun c -> write_list c list_feed [| i v.id; t limit; t offset |])
 
 let full_article c status stmt viewer key =
   match Pg.exec_one c stmt [| i viewer; key |] with
@@ -431,7 +640,13 @@ let full_article c status stmt viewer key =
 
 let get_article app req slug =
   let v = optional app req in
-  Pg.with_conn app.pool (fun c -> full_article c 200 article_by_slug v.id (t slug))
+  match app.lanes with
+  | Some l when batchable slug -> (
+      let p = Batch.submit l.article_lane { viewer = v.id; limit = "1"; offset = "0"; key = slug } in
+      match p.ids with
+      | [| id |] -> respond 200 (Resp.article_to_yojson { article = shared_article v.id p id })
+      | _ -> fail 404 "article not found")
+  | _ -> Pg.with_conn app.pool (fun c -> full_article c 200 article_by_slug v.id (t slug))
 
 let create_article app req =
   let v = required app req in
@@ -491,13 +706,22 @@ let favorite app req slug ~on =
 
 let get_comments app req slug =
   let v = optional app req in
+  match app.lanes with
+  | Some l when batchable slug ->
+      let p = Batch.submit l.comments_lane { c_viewer = v.id; c_slug = slug } in
+      if not p.found then fail 404 "article not found";
+      let comment (author_id, (fields : Resp.comment_fields)) : Resp.comment_fields =
+        { fields with author = { fields.author with following = Hashtbl.mem p.c_flags.following (v.id, author_id) } }
+      in
+      respond 200 (Resp.comments_to_yojson { comments = List.map comment p.comments })
+  | _ -> (
   match Pg.with_conn app.pool (fun c -> Pg.exec c list_comments [| i v.id; t slug |]) with
   | [] -> fail 404 "article not found"
   | rows ->
       let rows = List.filter (fun (r : Pg.row) -> r.(0) <> None) rows in
       respond 200
         (Resp.comments_to_yojson
-           { comments = List.map (fun r -> comment_of_row r ~following:(Pg.bool r 7)) rows })
+           { comments = List.map (fun r -> comment_of_row r ~following:(Pg.bool r 7)) rows }))
 
 let create_comment app req slug =
   let v = required app req in
@@ -521,9 +745,20 @@ let delete_comment_h app req slug raw_id =
               ignore (Pg.exec c delete_comment [| id |]);
               no_content)
 
+let tags_response c =
+  match Pg.exec_one c all_tags [||] with
+  | Some r -> respond 200 (Resp.tags_to_yojson { tags = Pg.text_array r 0 })
+  | None -> failwith "tags: no row"
+
 let tags app =
-  let rows = Pg.with_conn app.pool (fun c -> Pg.exec c all_tags [||]) in
-  respond 200 (Resp.tags_to_yojson { tags = List.map (fun r -> Pg.get r 0) rows })
+  match app.lanes with
+  | Some l -> Batch.submit l.tags_lane ()
+  | None -> Pg.with_conn app.pool tags_response
+
+(* Everyone waiting gets the same response. *)
+let run_tags c inputs =
+  let r = tags_response c in
+  List.map (fun () -> r) inputs
 
 (* ---------- routing ---------- *)
 

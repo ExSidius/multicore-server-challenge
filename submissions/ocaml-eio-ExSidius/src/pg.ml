@@ -157,6 +157,13 @@ let get (r : row) i = match r.(i) with Some s -> s | None -> failwith "postgres:
 let int r i = Int64.to_int (String.get_int64_be (get r i) 0)
 let bool r i = (get r i).[0] <> '\000'
 let timestamp r i = String.get_int64_be (get r i) 0
+let int4 r i = Int32.to_int (String.get_int32_be (get r i) 0)
+
+(* A one-dimensional bigint[]; an empty array has zero dimensions. *)
+let int_array r i =
+  let s = get r i in
+  if String.get_int32_be s 0 = 0l then [||]
+  else Array.init (Int32.to_int (String.get_int32_be s 12)) (fun k -> Int64.to_int (String.get_int64_be s (24 + (k * 12))))
 
 (* A one-dimensional text[]; an empty array has zero dimensions. *)
 let text_array r i =
