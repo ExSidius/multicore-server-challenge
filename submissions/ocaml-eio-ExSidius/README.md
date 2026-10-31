@@ -9,19 +9,19 @@
 | HTTP | ~200 lines in `src/http.ml`: HTTP/1.1, keep-alive, `Content-Length` bodies |
 | Postgres | [postgresql-ocaml](https://github.com/mmottl/postgresql-ocaml) 5.4.0 (libpq) in non-blocking mode, awaited through Eio; prepared statements, binary results |
 | JSON | [ppx_deriving_yojson](https://github.com/ocaml-ppx/ppx_deriving_yojson) 3.10.0 on Yojson 3.0.0: serializers derived from the request and response types |
-| bcrypt | libxcrypt `crypt_r` through a small C stub that releases the runtime lock, on an `Eio.Executor_pool` |
+| bcrypt | C threads hashing up to 4 passwords at once (`src/bcrypt_stubs.c`, kernel and tables after `c-epoll-umitaltintas`), checked against libxcrypt at startup |
 | JWT | HS256 from [digestif](https://github.com/mirage/digestif) 1.4.1 |
 
 ## Design
 
 - **Domains.** `WORKERS` (default 6) domains each run an event loop with their own `SO_REUSEPORT` listener and share
-  of the Postgres connections. With `BCRYPT_DOMAINS` (default 2) that makes 8 domains for 8 cores, the limit Eio's
-  documentation recommends. Two bcrypt domains handle about 40 hashes per second, which is the login rate of
-  roughly 140,000 users.
+  of the Postgres connections. `BCRYPT_THREADS` (default 2) plain C threads do the hashing at `BCRYPT_NICE` (default 19).
 - **`PG_CONNECTIONS`** (default 30) is split evenly between network domains. A request holds one connection for all
   its statements. The reference SQL runs unchanged and is prepared once per connection.
-- **bcrypt never blocks an event loop.** A login's fiber suspends while a bcrypt domain does the work, and the C
-  stub releases the runtime lock so that domain doesn't delay other domains' minor collections.
+- **bcrypt never blocks an event loop.** A login's fiber suspends on its job's eventfd. Interleaving 4 hashes costs
+  18-32 ms of CPU per hash on the benchmark box, against 51-56 ms alone. A hash waits up to `BCRYPT_WAIT_MS` (default
+  400) for others to share its batch, unless no other login arrived recently. Every password still gets its own
+  full cost-10 hash, and nothing is kept.
 
 This is a first prototype: no pipelining, no query batching and no SQL changes yet.
 

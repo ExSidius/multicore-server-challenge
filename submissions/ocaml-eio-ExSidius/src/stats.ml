@@ -3,6 +3,9 @@
 let enabled = Sys.getenv_opt "CONDUIT_STATS" = Some "1"
 let now = Unix.gettimeofday
 
+external bcrypt_hashes : unit -> int = "conduit_bcrypt_hashes" [@@noalloc]
+external bcrypt_batches : unit -> int = "conduit_bcrypt_batches" [@@noalloc]
+
 type t = {
   mutable conns : int;
   mutable requests : int;
@@ -106,10 +109,10 @@ let reporter ~clock ~domain ~pool_free =
       if t -. !last >= 1. then begin
         let gc = Gc.quick_stat () in
         Printf.eprintf
-          "stats ts=%.3f domain=%d conns=%d requests=%d errors=%d pool_free=%d pool_waiting=%d pool_takes=%d pool_wait_ms=%.1f pool_wait_max_ms=%.1f pg_calls=%d pg_ms=%.1f handler_ms=%.1f handler_max_ms=%.1f bcrypt_calls=%d bcrypt_ms=%.1f lag_max_ms=%.1f lag_total_ms=%.1f minor_gcs=%d major_gcs=%d minor_mwords=%.1f heap_mwords=%d\n%!"
+          "stats ts=%.3f domain=%d conns=%d requests=%d errors=%d pool_free=%d pool_waiting=%d pool_takes=%d pool_wait_ms=%.1f pool_wait_max_ms=%.1f pg_calls=%d pg_ms=%.1f handler_ms=%.1f handler_max_ms=%.1f bcrypt_calls=%d bcrypt_ms=%.1f bcrypt_hashes_total=%d bcrypt_batches_total=%d lag_max_ms=%.1f lag_total_ms=%.1f minor_gcs=%d major_gcs=%d minor_mwords=%.1f heap_mwords=%d\n%!"
           t domain s.conns s.requests s.errors (pool_free ()) s.pool_waiting s.pool_takes (ms s.pool_wait)
           (ms s.pool_wait_max) s.pg_calls (ms s.pg_time) (ms s.handler_time) (ms s.handler_max) s.bcrypt_calls
-          (ms s.bcrypt_time) (ms s.lag_max) (ms s.lag_total)
+          (ms s.bcrypt_time) (bcrypt_hashes ()) (bcrypt_batches ()) (ms s.lag_max) (ms s.lag_total)
           (gc.minor_collections - !gc0.minor_collections)
           (gc.major_collections - !gc0.major_collections)
           ((gc.minor_words -. !gc0.minor_words) /. 1e6)

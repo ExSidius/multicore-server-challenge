@@ -1,5 +1,5 @@
 (* One Eio event loop per domain, each with its own SO_REUSEPORT listener and share of the Postgres connections,
-   plus a pool of domains for bcrypt. *)
+   plus C threads for bcrypt. *)
 let getenv k default = match Sys.getenv_opt k with Some v when v <> "" -> v | _ -> default
 let getenv_int k default = int_of_string (getenv k (string_of_int default))
 let queue_depth = 4096
@@ -33,14 +33,15 @@ let () =
   let db = Sys.getenv "DATABASE_URL" in
   let secret = Sys.getenv "JWT_SECRET" in
   let workers = max 1 (getenv_int "WORKERS" 6) in
-  let bcrypt_domains = max 1 (getenv_int "BCRYPT_DOMAINS" 2) in
   let pool_size = max 1 (getenv_int "PG_CONNECTIONS" 30 / workers) in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   let serve = serve ~host ~port ~db ~pool_size ~secret in
   try
+    Bcrypt.start
+      ~threads:(max 1 (getenv_int "BCRYPT_THREADS" 2))
+      ~wait_ms:(getenv_int "BCRYPT_WAIT_MS" 400)
+      ~nice:(getenv_int "BCRYPT_NICE" 19);
     Eio_linux.run ~queue_depth @@ fun env ->
-    Eio.Switch.run @@ fun sw ->
-    Bcrypt.init (Eio.Executor_pool.create ~sw ~domain_count:bcrypt_domains (Eio.Stdenv.domain_mgr env));
     for d = 2 to workers do
       ignore (Domain.spawn (fun () -> try Eio_linux.run ~queue_depth (serve d) with e -> die e))
     done;

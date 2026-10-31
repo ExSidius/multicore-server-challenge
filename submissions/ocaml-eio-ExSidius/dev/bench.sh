@@ -6,7 +6,7 @@
 #   dev/tools.sh dev/bench.sh probe 20000 40000    # full seed, one 60 s ramp + 60 s measure per user count
 #   dev/tools.sh dev/bench.sh search               # ~30 min: warm-up, doubling, bisection to 5%, 5-minute hold
 #
-# Options come from the environment: LABEL, WORKERS, BCRYPT_DOMAINS, PG_CONNECTIONS, VUS_PER_BOX, START_USERS, THINK_SCALE (probes only, to compare with older runs).
+# Options come from the environment: LABEL, WORKERS, BCRYPT_THREADS, PG_CONNECTIONS, VUS_PER_BOX, START_USERS, THINK_SCALE (probes only, to compare with older runs).
 #
 # How this differs from the official score, and why local numbers are only comparable with each other: one machine,
 # with the target pinned to 8 hardware threads and the load generators to the other CCD. The CPU is not the benchmark
@@ -53,7 +53,7 @@ prepare() { # template seed-label articles
   for _ in $(seq 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/tags" && break; sleep 1; done
   curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/tags" || { echo "server didn't come up"; cat "$RUN_DIR/server.log"; exit 1; }
   { echo "commit $SHA"; echo "loadavg $(cat /proc/loadavg)"; echo "cpus target=$TARGET_CPUS loadgen=$LOADGEN_CPUS"
-    env | command grep -E '^(WORKERS|BCRYPT_DOMAINS|PG_CONNECTIONS|OCAMLRUNPARAM)=' || true; } > "$RUN_DIR/meta.txt"
+    env | command grep -E '^(WORKERS|BCRYPT_THREADS|PG_CONNECTIONS|OCAMLRUNPARAM)=' || true; } > "$RUN_DIR/meta.txt"
 }
 
 # Total CPU ticks of a set of pids.
@@ -100,7 +100,7 @@ run() {
   line=$(jq -r '[(.overall.rps | round), .overall.p50_ms, .overall.p95_ms, .overall.p99_ms, (.overall.error_rate * 100), (if .verdict.pass then "PASS" else "FAIL" end), .verdict.lg_limited] | @tsv' "$dir/merged.json")
   [ -f "$HISTORY" ] || echo "$HISTORY_HEADER" > "$HISTORY"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Iseconds)" "$SHA" "${LABEL:-}" "$SEED" "$phase" \
-    "${WORKERS:-6}+${BCRYPT_DOMAINS:-2}" "${PG_CONNECTIONS:-30}" "$users" "$boxes" "$scale" "$line" "$app_pct" "$pg_pct" "$rss" "$RUN_ID" >> "$HISTORY"
+    "${WORKERS:-6}+${BCRYPT_THREADS:-2}" "${PG_CONNECTIONS:-30}" "$users" "$boxes" "$scale" "$line" "$app_pct" "$pg_pct" "$rss" "$RUN_ID" >> "$HISTORY"
   printf '%-8s users=%-7s boxes=%-3s scale=%-4s | %s | app %s%% pg %s%% rss %sMB\n' "$phase" "$users" "$boxes" "$scale" "$(tr '\t' ' ' <<<"$line")" "$app_pct" "$pg_pct" "$rss" | tee -a "$RUN_DIR/summary.txt"
   if [ "$(jq -r .verdict.lg_limited "$dir/merged.json")" = true ]; then
     echo "load generator limited at $users: this result says nothing about the server" | tee -a "$RUN_DIR/summary.txt"; LG_LIMITED=1
