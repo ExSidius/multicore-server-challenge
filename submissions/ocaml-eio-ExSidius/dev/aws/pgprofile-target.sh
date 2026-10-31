@@ -49,7 +49,9 @@ SQL
     perf report -i "$OUT/perf.data" --no-children --comm postgres --sort dso -g none --percent-limit 0.3 --stdio 2>/dev/null | grep -vE '^#|^$' > "$OUT/postgres_by_dso.txt"
     perf report -i "$OUT/perf.data" --no-children --comm postgres --sort symbol -g none --percent-limit 0.25 --stdio 2>/dev/null | grep -vE '^#|^$' > "$OUT/postgres_symbols.txt"
     perf report -i "$OUT/perf.data" --no-children --comm main.exe --sort symbol -g none --percent-limit 0.4 --stdio 2>/dev/null | grep -vE '^#|^$' > "$OUT/app_symbols.txt"
-    rm -f "$OUT/perf.data" ;;
+    perf report -i "$OUT/perf.data" --no-children --comm main.exe --sort dso -g none --percent-limit 0.05 --stdio 2>/dev/null | grep -vE '^#|^$' > "$OUT/app_by_dso.txt"
+    perf report -i "$OUT/perf.data" --no-children --comm main.exe --sort dso,symbol -g none --percent-limit 0.04 --stdio 2>/dev/null | grep -vE '^#|^$' > "$OUT/app_all_symbols.txt"
+    runuser -u postgres -- psql -qtAX -d postgres -c "SELECT ssl, count(*) FROM pg_stat_ssl s JOIN pg_stat_activity a USING (pid) WHERE a.backend_type = 'client backend' AND a.datname = 'conduit' GROUP BY 1" > "$OUT/tls.txt" ;;
   teardown)
     rm -f "$CONF"
     systemctl restart postgresql@18-main ;;

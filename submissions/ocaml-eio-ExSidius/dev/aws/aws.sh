@@ -100,7 +100,7 @@ case "${1:-}" in
     on_target "sudo systemctl stop challenge; sudo bash $TOOL setup; sudo /opt/conduit-tools/switch.sh $NAME --no-conformance | tail -1 | cut -c1-100"
     on_loadgen "sudo mkdir -p /root/pgprofile/$LABEL; sudo env CONDUIT_JWT_SECRET=multicore-server-challenge sh -c 'ulimit -n 1048576; setsid nohup conduit-loadgen run -target $URLS -users $USERS -box-index 0 -id-offset 0 -ramp 60s -measure 150s -tail 15s -secret multicore-server-challenge -run-id prof\$(date +%s) -q -out /root/pgprofile/$LABEL/box0.json > /root/pgprofile/$LABEL/run.log 2>&1 </dev/null &'"
     on_target "sudo bash $TOOL capture /root/pgprofile/$LABEL 90"
-    sleep 50
+    sleep 90
     on_loadgen "sudo conduit-loadgen merge -o /root/pgprofile/$LABEL/merged.json /root/pgprofile/$LABEL/box0.json | tail -6 | cut -c1-120 || true"
     on_target "sudo bash $TOOL teardown"
     DEST="$SUB/dev/results/aws/pgprofile-$LABEL"; mkdir -p "$DEST"
