@@ -55,10 +55,10 @@ let () =
   let port = getenv_int "PORT" 3000 in
   let db = Sys.getenv "DATABASE_URL" in
   let secret = Sys.getenv "JWT_SECRET" in
-  let workers = max 1 (getenv_int "WORKERS" 6) in
+  let workers = max 1 (getenv_int "WORKERS" 2) in
   let pool_size = max 1 (getenv_int "PG_CONNECTIONS" 30 / workers) in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-  let window = float (getenv_int "BATCH_WINDOW_MS" 200) /. 1000. in
+  let window = float (getenv_int "BATCH_WINDOW_MS" 150) /. 1000. in
   let lanes =
     if window <= 0. then None
     else
