@@ -2,8 +2,9 @@
 
    One hash is a chain of dependent S-box loads, so alone it leaves the core waiting on load latency. Each lane here
    is a whole independent bcrypt state, and every step is done for all lanes back to back: on the benchmark box 4
-   lanes cost 18-32 ms of CPU per hash against 51-56 ms alone. The kernel follows c-epoll-umitaltintas, and
-   bf_tables.h comes from there. Each password gets its own hash and its own salt; nothing is merged or kept.
+   lanes cost 17-27 ms of CPU per hash against 51-56 ms alone. The kernel follows c-epoll-umitaltintas, and
+   bf_tables.h comes from there; on CPUs with BMI, the cost loop runs hand-scheduled assembly (bcrypt_expand0.c) after
+   zig-iouring-nick-potts. Each password gets its own hash and its own salt; nothing is merged or kept.
 
    The threads run at low priority, so they must never hold anything the rest of the process needs: an OCaml domain
    preempted here would stall every domain's stop-the-world GC, which is why these aren't domains, and callers push
@@ -30,7 +31,7 @@
 #include <caml/mlvalues.h>
 #include "bf_tables.h"
 
-#define LANES 4
+#define LANES 5
 #define COST 10
 #define AI static inline __attribute__((always_inline))
 #define EACH for (int l = 0; l < n; l++)
@@ -89,6 +90,28 @@ AI void bf_chain(int n, bf_t *st, uint32_t (*salt)[4]) {
   }
 }
 
+#if defined(__x86_64__)
+void conduit_expand0_1(uint32_t *);
+void conduit_expand0_2(uint32_t *);
+void conduit_expand0_3(uint32_t *);
+void conduit_expand0_4(uint32_t *);
+void conduit_expand0_5(uint32_t *);
+static void (*const expand0_by_n[LANES + 1])(uint32_t *) = {NULL, conduit_expand0_1, conduit_expand0_2, conduit_expand0_3,
+                                                            conduit_expand0_4, conduit_expand0_5};
+#endif
+static int use_asm = 0;
+
+/* One expansion with no salt, the whole of the cost loop. */
+AI void chain0(int n, bf_t *st) {
+#if defined(__x86_64__)
+  if (use_asm) {
+    expand0_by_n[n](st->w);
+    return;
+  }
+#endif
+  bf_chain(n, st, NULL);
+}
+
 AI void eks(int n, bf_t *st, uint32_t (*key)[18], uint32_t (*salt)[4], int cost, uint32_t (*out)[6]) {
   EACH {
     memcpy(P(&st[l]), bf_init_p, sizeof bf_init_p);
@@ -98,9 +121,9 @@ AI void eks(int n, bf_t *st, uint32_t (*key)[18], uint32_t (*salt)[4], int cost,
   bf_chain(n, st, salt);
   for (uint64_t r = (uint64_t)1 << cost; r; r--) {
     EACH for (int i = 0; i < 18; i++) P(&st[l])[i] ^= key[l][i];
-    bf_chain(n, st, NULL);
+    chain0(n, st);
     EACH for (int i = 0; i < 18; i++) P(&st[l])[i] ^= salt[l][i & 3];
-    bf_chain(n, st, NULL);
+    chain0(n, st);
   }
   static const uint32_t magic[6] = {0x4f727068, 0x65616e42, 0x65686f6c, 0x64657253, 0x63727944, 0x6f756274};
   EACH memcpy(out[l], magic, sizeof magic);
@@ -127,7 +150,8 @@ EKS_N(1)
 EKS_N(2)
 EKS_N(3)
 EKS_N(4)
-static const eks_fn eks_by_n[LANES + 1] = {NULL, eks1, eks2, eks3, eks4};
+EKS_N(5)
+static const eks_fn eks_by_n[LANES + 1] = {NULL, eks1, eks2, eks3, eks4, eks5};
 
 static const char b64[] = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -331,7 +355,7 @@ static void *worker(void *arg) {
 /* Checks every batch width against libxcrypt, at a low cost so that it takes about a millisecond each. */
 static int selftest(void) {
   static const char *pws[] = {"", "a", "password123", "012345678901234567890123456789012345678901234567890123456789012345678901"};
-  static const char *settings[] = {"$2b$04$abcdefghijklmnopqrstuu", "$2a$04$./ABCDEFGHIJKLMNOPQRSTUV", "$2y$04$zyxwvutsrqponmlkjihgfe", "$2b$04$0123456789abcdefghijkl"};
+  static const char *settings[] = {"$2b$04$abcdefghijklmnopqrstuu", "$2a$04$./ABCDEFGHIJKLMNOPQRSTUV", "$2y$04$zyxwvutsrqponmlkjihgfe", "$2b$04$0123456789abcdefghijkl", "$2b$04$NMLKJIHGFEDCBA9876543u"};
   struct crypt_data *cd = calloc(1, sizeof *cd);
   if (!cd) return 0;
   int ok = 1;
@@ -341,7 +365,7 @@ static int selftest(void) {
     memset(store, 0, sizeof store);
     EACH {
       store[l].pw = (char *)pws[(l + n) % 4];
-      store[l].setting = (char *)settings[l];
+      store[l].setting = (char *)settings[l % 5];
       jobs[l] = &store[l];
       if (prepare(jobs[l]) != 4) ok = 0;
     }
@@ -357,6 +381,9 @@ static int selftest(void) {
 
 CAMLprim value conduit_bcrypt_start(value threads, value wait_ms, value nice) {
   CAMLparam3(threads, wait_ms, nice);
+#if defined(__x86_64__)
+  use_asm = __builtin_cpu_supports("bmi") && __builtin_cpu_supports("bmi2");
+#endif
   if (!selftest()) caml_failwith("bcrypt: the kernel disagrees with libxcrypt");
   wait_ns = (int64_t)Long_val(wait_ms) * 1000000;
   nice_level = Int_val(nice);

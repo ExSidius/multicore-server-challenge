@@ -1,4 +1,4 @@
-(* bcrypt cost 10 on C threads that hash up to 4 passwords at once (bcrypt_stubs.c). The calling fiber suspends on the
+(* bcrypt cost 10 on C threads that hash up to 5 passwords at once (bcrypt_stubs.c). The calling fiber suspends on the
    job's eventfd, so its domain keeps serving other connections. *)
 external start_stub : int -> int -> int -> unit = "conduit_bcrypt_start"
 external submit : string -> string -> int = "conduit_bcrypt_submit"

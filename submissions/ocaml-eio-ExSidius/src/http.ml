@@ -25,10 +25,20 @@ let reason = function
 
 let head status len ~close =
   let conn = if close then "Connection: close\r\n" else "" in
-  if status = 204 then Printf.sprintf "HTTP/1.1 204 No Content\r\n%s\r\n" conn
+  if status = 204 then "HTTP/1.1 204 No Content\r\n" ^ conn ^ "\r\n"
   else
-    Printf.sprintf "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n%s\r\n" status
-      (reason status) len conn
+    String.concat ""
+      [
+        "HTTP/1.1 ";
+        string_of_int status;
+        " ";
+        reason status;
+        "\r\nContent-Type: application/json\r\nContent-Length: ";
+        string_of_int len;
+        "\r\n";
+        conn;
+        "\r\n";
+      ]
 
 let rec find_end s i =
   match String.index_from_opt s i '\r' with
