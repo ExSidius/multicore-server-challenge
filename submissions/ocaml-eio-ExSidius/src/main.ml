@@ -64,21 +64,25 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers ~watch
   in
   (* The list statements are the slow ones, so they get several fibers, on consecutive domains. Write lanes keep one:
      concurrent batches could lock the same rows in different orders. *)
-  let list_lane home l f =
-    for i = 0 to list_fibers - 1 do
+  let fibers n home l f =
+    for i = 0 to n - 1 do
       lane (home + i) l f
     done
   in
+  let list_lane home l f = fibers list_fibers home l f in
   Option.iter
     (fun (l : App.lanes) ->
       lane 1 l.tags_lane App.run_tags;
-      list_lane 2 l.global_lane (App.run_pages App.global_batch);
-      list_lane 3 l.feed_lane App.run_feed;
-      list_lane 5 l.tag_lane (App.run_pages App.tag_batch);
-      list_lane 6 l.author_lane (App.run_pages App.author_batch);
-      list_lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
-      lane 2 l.article_lane (App.run_pages App.article_batch);
-      lane 5 l.comments_lane App.run_comments;
+      let shared = getenv_int "SHARED_FETCH" 0 = 1 in
+      if shared then fibers (getenv_int "FETCH_LANE_FIBERS" 2) 4 l.fetch_lane App.run_fetch;
+      let pages batch via = if shared then App.run_pages_via l.fetch_lane via else App.run_pages batch in
+      list_lane 2 l.global_lane (pages App.global_batch App.global_pages);
+      fibers (getenv_int "FEED_LANE_FIBERS" list_fibers) 3 l.feed_lane (if shared then App.run_feed ~fetch:l.fetch_lane else fun c i -> App.run_feed c i);
+      list_lane 5 l.tag_lane (pages App.tag_batch App.tag_pages);
+      list_lane 6 l.author_lane (pages App.author_batch App.author_pages);
+      list_lane 1 l.favorited_lane (pages App.favorited_batch App.favorited_pages);
+      fibers (getenv_int "ARTICLE_LANE_FIBERS" 1) 2 l.article_lane (App.run_pages App.article_batch);
+      fibers (getenv_int "COMMENTS_LANE_FIBERS" 1) 5 l.comments_lane App.run_comments;
       lane 4 l.profile_lane App.run_profiles;
       lane 5 l.user_lane App.run_users;
       lane 6 l.favorite_lane (App.run_favorites App.favorite_batch);
@@ -120,10 +124,14 @@ let () =
   let lanes =
     if window_max <= 0. then None
     else
-      let lane name = Batch.create ~name ~window:Load.window in
+      let lane name =
+        let pct = float (getenv_int ("WINDOW_PCT_" ^ String.uppercase_ascii name) 100) /. 100. in
+        Batch.create ~name ~window:(fun () -> Load.window () *. pct)
+      in
       Some
         App.
           {
+            fetch_lane = lane "fetch";
             tags_lane = lane "tags";
             global_lane = lane "global";
             feed_lane = lane "feed";

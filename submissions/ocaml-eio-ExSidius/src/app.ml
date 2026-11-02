@@ -131,8 +131,27 @@ let all_tags = s "SELECT ARRAY(SELECT name FROM tags ORDER BY name)"
    order under the database's C.UTF-8 collation. *)
 let page_input = "unnest($2::int[], $3::bigint[], $4::text[]) WITH ORDINALITY p(lim, off, key, ord)"
 
-let batch_stmt ?(body = false) ?(pre = "") ?(count = "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id)") pages =
-  s ("WITH " ^ pre ^ "pages AS MATERIALIZED (" ^ pages
+let bulk_lookups = Sys.getenv_opt "BATCH_ANY" = Some "1"
+
+let batch_stmt ?(body = false) ?(pre = "") ?count pages =
+  let bulk = bulk_lookups && count = None in
+  let count = Option.value count ~default:"(SELECT count(*) FROM favorites f WHERE f.article_id = a.id)" in
+  let finish sql =
+    if not bulk then sql
+    else begin
+      let swap a b str =
+        match Str.search_forward (Str.regexp_string a) str 0 with
+        | i -> String.sub str 0 i ^ b ^ String.sub str (i + String.length a) (String.length str - i - String.length a)
+      in
+      let id = "ARRAY(SELECT id FROM ids)" in
+      sql
+      |> swap "arts AS MATERIALIZED (" ("cnt AS MATERIALIZED (SELECT f.article_id id, count(*) n FROM favorites f WHERE f.article_id = ANY(" ^ id ^ ") GROUP BY 1),\ntg AS MATERIALIZED (SELECT at.article_id id, array_agg(at.tag_id::bigint) tag_ids FROM article_tags at WHERE at.article_id = ANY(" ^ id ^ ") GROUP BY 1),\narts AS MATERIALIZED (")
+      |> swap "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id)" "COALESCE(c.n, 0)"
+      |> swap "ARRAY(SELECT at.tag_id::bigint FROM article_tags at WHERE at.article_id = a.id)" "COALESCE(t.tag_ids, '{}')"
+      |> swap "FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id)" ("FROM articles a JOIN users u ON u.id = a.author_id LEFT JOIN cnt c ON c.id = a.id LEFT JOIN tg t ON t.id = a.id WHERE a.id = ANY(" ^ id ^ "))")
+    end
+  in
+  s @@ finish ("WITH " ^ pre ^ "pages AS MATERIALIZED (" ^ pages
     ^ "),\nids AS MATERIALIZED (SELECT DISTINCT unnest(ids) AS id FROM pages ORDER BY id),\narts AS MATERIALIZED (\n  SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, "
     ^ (if body then "a.body" else "NULL::text AS body")
     ^ ",\n         ARRAY(SELECT at.tag_id::bigint FROM article_tags at WHERE at.article_id = a.id) AS tag_ids,\n         " ^ count ^ " AS n, u.username, u.bio, u.image\n    FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id)\nSELECT 1 AS kind, ord::bigint AS id, total AS x, ids, NULL AS slug, NULL AS title, NULL AS description,\n       NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::bigint[] AS tag_ids, NULL::bigint AS n,\n       NULL AS username, NULL AS bio, NULL AS image, NULL AS body\n  FROM pages\nUNION ALL SELECT 2, id, author_id, NULL, slug, title, description, created_at, updated_at, tag_ids, n, username, bio, image, body FROM arts\nUNION ALL SELECT 3, f.user_id, f.article_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN favorites f ON f.user_id = v.id WHERE f.article_id IN (SELECT id FROM ids)\nUNION ALL SELECT 4, fo.follower_id, fo.followee_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL\n  FROM unnest($1::bigint[]) v(id) JOIN follows fo ON fo.follower_id = v.id WHERE fo.followee_id IN (SELECT author_id FROM arts)\nUNION ALL SELECT 5, t.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, t.name, NULL, NULL, NULL\n  FROM tags t WHERE t.id IN (SELECT unnest(tag_ids) FROM arts)")
@@ -155,12 +174,36 @@ let favorited_batch =
   batch_stmt
     ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = u.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = u.id ORDER BY f.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT u.id FROM users u WHERE u.username = p.key) AS id) u")
 
+(* The same pages with no articles: the fetch lane reads those, for every lane at once. Rows as batch_stmt's kind 1. *)
+let pages_stmt ?(pre = "") pages =
+  s ("WITH " ^ pre ^ "pages AS MATERIALIZED (" ^ pages ^ ")\nSELECT 1 AS kind, ord::bigint AS id, total AS x, ids FROM pages WHERE $1::bigint[] IS NOT NULL")
+
+let global_pages =
+  pages_stmt ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s) AS total,\n         ARRAY(SELECT id FROM articles ORDER BY id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input)
+
+let tag_pages =
+  pages_stmt
+    ~pre:("pg AS MATERIALIZED (\n  SELECT p.ord, p.key, ARRAY(SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id ORDER BY at.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT t.id FROM tags t WHERE t.name = p.key) AS id) t),\nc AS MATERIALIZED (\n  SELECT d.key, COALESCE((SELECT 1000::bigint FROM article_tags at WHERE at.tag_id = t.id OFFSET 999 LIMIT 1),\n                        (SELECT count(*) FROM article_tags at WHERE at.tag_id = t.id)) AS total\n    FROM (SELECT DISTINCT key FROM pg) d CROSS JOIN LATERAL (SELECT (SELECT t.id FROM tags t WHERE t.name = d.key) AS id) t),\n")
+    "SELECT pg.ord, c.total, pg.ids FROM pg JOIN c ON c.key = pg.key"
+
+let author_pages =
+  pages_stmt ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = u.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id = u.id ORDER BY a2.id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT u.id FROM users u WHERE u.username = p.key) AS id) u")
+
+let favorited_pages =
+  pages_stmt ("SELECT p.ord, (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = u.id LIMIT 1000) s) AS total,\n         ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = u.id ORDER BY f.article_id DESC LIMIT p.lim OFFSET p.off) AS ids\n    FROM " ^ page_input ^ " CROSS JOIN LATERAL (SELECT (SELECT u.id FROM users u WHERE u.username = p.key) AS id) u")
+
 (* A feed takes two statements. The first walks each followed author once, however many viewers in the batch follow
    them, up to the count cap or the deepest requested page; the app merges each viewer's page from that. Rows: 1 a
    viewer's followed authors, 3 an author's capped count and newest ids. $1 limits, $2 offsets, $3 viewers.
    Each author is read once for both count and ids; OCaml sums the counts for each viewer, capped at 1000. *)
 let feed_walk =
-  s "WITH p AS MATERIALIZED (SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[]) q(lim, off, viewer)),\nd AS MATERIALIZED (\n SELECT g.viewer,g.n,ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id=g.viewer) fo\n FROM (SELECT viewer,max(lim+off) n FROM p GROUP BY viewer) g),\nau AS MATERIALIZED (SELECT x.id,max(d.n) n FROM d CROSS JOIN LATERAL unnest(d.fo) x(id) GROUP BY x.id),\na AS MATERIALIZED (SELECT au.id,au.n,ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id=au.id ORDER BY a2.id DESC LIMIT greatest(1000,au.n)) ids FROM au)\nSELECT 1 AS kind,d.viewer a,0::bigint b,d.fo ids FROM d\nUNION ALL SELECT 3,a.id,least(1000,cardinality(a.ids))::bigint,a.ids[1:least(a.n,cardinality(a.ids))::int] FROM a"
+  let sorted sql =
+    if Sys.getenv_opt "FEED_SORTED" = Some "1" then Str.global_replace (Str.regexp_string "GROUP BY x.id)") "GROUP BY x.id ORDER BY x.id)" sql else sql
+  in
+  let sorted sql =
+    if Sys.getenv_opt "SORT_VIEWERS" = Some "1" then Str.global_replace (Str.regexp_string "GROUP BY viewer) g)") "GROUP BY viewer ORDER BY viewer) g)" (sorted sql) else sorted sql
+  in
+  s @@ sorted "WITH p AS MATERIALIZED (SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[]) q(lim, off, viewer)),\nd AS MATERIALIZED (\n SELECT g.viewer,g.n,ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id=g.viewer) fo\n FROM (SELECT viewer,max(lim+off) n FROM p GROUP BY viewer) g),\nau AS MATERIALIZED (SELECT x.id,max(d.n) n FROM d CROSS JOIN LATERAL unnest(d.fo) x(id) GROUP BY x.id),\na AS MATERIALIZED (SELECT au.id,au.n,ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id=au.id ORDER BY a2.id DESC LIMIT greatest(1000,au.n)) ids FROM au)\nSELECT 1 AS kind,d.viewer a,0::bigint b,d.fo ids FROM d\nUNION ALL SELECT 3,a.id,least(1000,cardinality(a.ids))::bigint,a.ids[1:least(a.n,cardinality(a.ids))::int] FROM a"
 
 (* The second fetches the articles those pages need: $1 viewers, $2 ids, with no count of its own. *)
 let feed_fetch = batch_stmt "SELECT 1::bigint AS ord, 0::bigint AS total, $2::bigint[] AS ids"
@@ -326,7 +369,11 @@ type shared_comments = { found : bool; comments : (int * string) list; c_flags :
 (* username -> id, bio, image; and who among the batch's viewers follows whom. *)
 type shared_profiles = { users : (string, int * string option * string option) Hashtbl.t; p_following : (int * int, unit) Hashtbl.t }
 
+(* Viewers and article ids wanted by one batch, and the articles and flags read for every such batch at once. *)
+type fetched = { f_articles : (int, rendered) Hashtbl.t; f_flags : page_flags }
+
 type lanes = {
+  fetch_lane : (int list * int array, fetched) Batch.t;
   tags_lane : (unit, Http.response) Batch.t;
   global_lane : (page_request, shared_page) Batch.t;
   feed_lane : (page_request, shared_page) Batch.t;
@@ -415,8 +462,12 @@ let t v = Some v
 
 let viewer_list_literal ids = "{" ^ String.concat "," (List.map string_of_int ids) ^ "}"
 
+let sort_viewers = Sys.getenv_opt "SORT_VIEWERS" = Some "1"
+
 let viewer_literal viewers =
-  "{" ^ String.concat "," (Hashtbl.fold (fun v () acc -> string_of_int v :: acc) viewers []) ^ "}"
+  let ids = Hashtbl.fold (fun v () acc -> v :: acc) viewers [] in
+  let ids = if sort_viewers then List.sort compare ids else ids in
+  "{" ^ String.concat "," (List.map string_of_int ids) ^ "}"
 
 (* The strings can't hold NUL or anything an array literal would change: a request whose key could, doesn't batch. *)
 let batchable key = not (String.contains key '\000')
@@ -664,6 +715,83 @@ let decode_pages rows n =
     !raw;
   (totals, ids_of, articles, flags)
 
+(* Measures what one statement across lanes could save: articles read per second, and how many were distinct. *)
+let overlap_log = Sys.getenv_opt "OVERLAP_LOG" = Some "1"
+let overlap_lock = Mutex.create ()
+let overlap_seen : (int, unit) Hashtbl.t = Hashtbl.create 4096
+let overlap_sum = ref 0
+let overlap_batches = ref 0
+let overlap_last = ref 0.
+
+let overlap_note articles =
+  if overlap_log then begin
+    Mutex.lock overlap_lock;
+    incr overlap_batches;
+    overlap_sum := !overlap_sum + Hashtbl.length articles;
+    Hashtbl.iter (fun id _ -> Hashtbl.replace overlap_seen id ()) articles;
+    let now = Unix.gettimeofday () in
+    if now -. !overlap_last >= 1. then begin
+      Printf.eprintf "overlap batches=%d read=%d distinct=%d\n%!" !overlap_batches !overlap_sum (Hashtbl.length overlap_seen);
+      overlap_last := now;
+      overlap_sum := 0;
+      overlap_batches := 0;
+      Hashtbl.reset overlap_seen
+    end;
+    Mutex.unlock overlap_lock
+  end
+
+(* The second stage of a list or feed: every lane's wanted articles, read once. *)
+let run_fetch c (inputs : (int list * int array) list) =
+  let viewers = Hashtbl.create 64 and wanted = Hashtbl.create 1024 in
+  List.iter
+    (fun (vs, ids) ->
+      List.iter (fun v -> Hashtbl.replace viewers v ()) vs;
+      Array.iter (fun id -> Hashtbl.replace wanted id ()) ids)
+    inputs;
+  let rows = Pg.exec c feed_fetch [| t (viewer_literal viewers); t (viewer_literal wanted) |] in
+  let _, _, articles, flags = decode_pages rows 1 in
+  overlap_note articles;
+  let shared = { f_articles = articles; f_flags = flags } in
+  List.map (fun _ -> shared) inputs
+
+(* An article deleted between the two statements just drops out. *)
+let present articles ids =
+  if Array.for_all (Hashtbl.mem articles) ids then ids
+  else Array.of_list (List.filter (Hashtbl.mem articles) (Array.to_list ids))
+
+let run_pages_via fetch stmt c (inputs : page_request list) =
+  let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and keys = ref [] and n = ref 0 in
+  let viewers = Hashtbl.create 16 in
+  List.iter
+    (fun q ->
+      if q.viewer <> 0 then Hashtbl.replace viewers q.viewer ();
+      let k = (q.limit, q.offset, q.key) in
+      if not (Hashtbl.mem pages k) then begin
+        incr n;
+        Hashtbl.add pages k !n;
+        limits := q.limit :: !limits;
+        offsets := q.offset :: !offsets;
+        keys := q.key :: !keys
+      end)
+    inputs;
+  let rows =
+    Pg.exec c stmt
+      [|
+        t (viewer_literal viewers);
+        t ("{" ^ String.concat "," (List.rev !limits) ^ "}");
+        t ("{" ^ String.concat "," (List.rev !offsets) ^ "}");
+        t (Pg.text_array_literal (List.rev !keys));
+      |]
+  in
+  let totals, ids_of, _, _ = decode_pages rows !n in
+  let wanted = Array.concat (Array.to_list ids_of) in
+  let f = Batch.submit fetch (Hashtbl.fold (fun v () acc -> v :: acc) viewers [], wanted) in
+  List.map
+    (fun q ->
+      let page = Hashtbl.find pages (q.limit, q.offset, q.key) in
+      { total = totals.(page); ids = present f.f_articles ids_of.(page); articles = f.f_articles; flags = f.f_flags })
+    inputs
+
 let run_pages ?(extra = fun _ -> [||]) stmt c (inputs : page_request list) =
   let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and keys = ref [] and n = ref 0 in
   let viewers = Hashtbl.create 16 in
@@ -691,13 +819,14 @@ let run_pages ?(extra = fun _ -> [||]) stmt c (inputs : page_request list) =
          (extra inputs))
   in
   let totals, ids_of, articles, flags = decode_pages rows !n in
+  overlap_note articles;
   List.map
     (fun q ->
       let page = Hashtbl.find pages (q.limit, q.offset, q.key) in
       { total = totals.(page); ids = ids_of.(page); articles; flags })
     inputs
 
-let run_feed c (inputs : page_request list) =
+let run_feed ?fetch c (inputs : page_request list) =
   let pages = Hashtbl.create 16 and limits = ref [] and offsets = ref [] and viewers = ref [] in
   List.iter
     (fun q ->
@@ -741,11 +870,21 @@ let run_feed c (inputs : page_request list) =
   List.iter (fun (k, ids) -> Hashtbl.replace page_ids k ids) merged;
   let viewer_set = Hashtbl.create 16 in
   List.iter (fun q -> Hashtbl.replace viewer_set q.viewer ()) inputs;
-  let rows =
-    Pg.exec c feed_fetch
-      [| t (viewer_literal viewer_set); t (viewer_literal wanted) |]
+  let articles, flags =
+    match fetch with
+    | Some lane ->
+        let f =
+          Batch.submit lane
+            ( Hashtbl.fold (fun v () acc -> v :: acc) viewer_set [],
+              Array.of_list (Hashtbl.fold (fun id () acc -> id :: acc) wanted []) )
+        in
+        (f.f_articles, f.f_flags)
+    | None ->
+        let rows = Pg.exec c feed_fetch [| t (viewer_literal viewer_set); t (viewer_literal wanted) |] in
+        let _, _, articles, flags = decode_pages rows 1 in
+        overlap_note articles;
+        (articles, flags)
   in
-  let _, _, articles, flags = decode_pages rows 1 in
   List.map
     (fun q ->
       (* An article deleted between the two statements just drops out, as it would between the reference's two. *)
